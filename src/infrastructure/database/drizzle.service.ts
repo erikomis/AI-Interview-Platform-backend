@@ -39,13 +39,6 @@ export class DrizzleService implements OnModuleInit, OnModuleDestroy {
       )
     `;
 
-    // Migrations: add new columns to existing tables (safe no-op if already present)
-    await this.sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`;
-    await this.sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS cv_summary TEXT`;
-    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS max_questions INTEGER NOT NULL DEFAULT 10`;
-    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS candidate_name TEXT`;
-    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS topics_covered JSONB`;
-
     await this.sql`
       CREATE TABLE IF NOT EXISTS refresh_tokens (
         id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -99,6 +92,15 @@ export class DrizzleService implements OnModuleInit, OnModuleDestroy {
         created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `;
+
+    // Migrations: add new columns to existing tables (safe no-op if already present).
+    // Must run after every CREATE TABLE, or a fresh database fails on a missing relation.
+    await this.sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`;
+    await this.sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS cv_summary TEXT`;
+    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS max_questions INTEGER NOT NULL DEFAULT 10`;
+    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS candidate_name TEXT`;
+    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS topics_covered JSONB`;
+    await this.sql`ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`;
 
     this.logger.log('Database tables ready');
   }

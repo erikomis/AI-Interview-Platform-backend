@@ -9,16 +9,23 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
   constructor(private readonly configService: ConfigService) {}
 
-  onModuleInit() {
+  async onModuleInit() {
     this.client = new Redis({
       host: this.configService.get('REDIS_HOST', 'localhost'),
-      port: this.configService.get<number>('REDIS_PORT', 6379),
+      port: Number(this.configService.get('REDIS_PORT', 6379)),
       password: this.configService.get('REDIS_PASSWORD') || undefined,
-      retryStrategy: (times) => Math.min(times * 100, 3000),
+      // Connect explicitly below so a missing Redis fails startup instead of
+      // silently queueing commands until the first request times out.
+      lazyConnect: true,
+      // Fail individual commands quickly while reconnecting instead of hanging requests
+      maxRetriesPerRequest: 2,
+      retryStrategy: (times) => Math.min(times * 200, 3000),
     });
 
     this.client.on('connect', () => this.logger.log('Redis connected'));
     this.client.on('error', (err) => this.logger.error('Redis error', err));
+
+    await this.client.connect();
   }
 
   async onModuleDestroy() {
@@ -31,6 +38,15 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     } else {
       await this.client.set(key, value);
     }
+  }
+
+  /**
+   * SET key value EX ttl NX — returns true only if the key was created.
+   * Used as a lightweight distributed lock.
+   */
+  async setNx(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    const result = await this.client.set(key, value, 'EX', ttlSeconds, 'NX');
+    return result === 'OK';
   }
 
   async get(key: string): Promise<string | null> {

@@ -24,6 +24,9 @@ export const refreshTokens = pgTable('refresh_tokens', {
   tokenHash: text('token_hash').notNull().unique(),
   expiresAt: timestamp('expires_at').notNull(),
   revoked: boolean('revoked').default(false).notNull(),
+  // When the token was rotated/revoked — lets refresh tell a benign concurrent
+  // retry (within a short grace window) apart from a genuine reuse attack.
+  revokedAt: timestamp('revoked_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
