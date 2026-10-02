@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { eq, and } from 'drizzle-orm';
 import { DrizzleService } from '../../../infrastructure/database/drizzle.service';
 import { TokenService } from '../../../infrastructure/auth/token.service';
@@ -7,7 +7,10 @@ import { users, refreshTokens } from '../../../infrastructure/database/schema';
 
 // A revoked token presented again within this window is treated as a benign
 // race (two tabs / a retried request refreshing concurrently), not as theft.
+// The loser gets 409 (not 401): the winner has already set fresh cookies, so the
+// client should simply retry /auth/me instead of logging the user out.
 export const REFRESH_REUSE_GRACE_MS = 30_000;
+export const TOKEN_ALREADY_ROTATED = 'Token already rotated';
 
 @Injectable()
 export class RefreshTokenUseCase {
@@ -40,7 +43,7 @@ export class RefreshTokenUseCase {
       const revokedAgo = token.revokedAt ? Date.now() - new Date(token.revokedAt).getTime() : Infinity;
       if (revokedAgo <= REFRESH_REUSE_GRACE_MS) {
         // Just rotated by a concurrent request — reject this one, keep other sessions alive
-        throw new UnauthorizedException('Refresh token already rotated');
+        throw new ConflictException(TOKEN_ALREADY_ROTATED);
       }
       // Token was already used long ago — genuine reuse attack, revoke everything
       await this.tokenService.revokeAllUserTokens(userId);
@@ -60,7 +63,8 @@ export class RefreshTokenUseCase {
       .returning({ id: refreshTokens.id });
 
     if (rotated.length === 0) {
-      throw new UnauthorizedException('Refresh token already rotated');
+      // Lost the race to a concurrent refresh that just rotated this token
+      throw new ConflictException(TOKEN_ALREADY_ROTATED);
     }
 
     const user = await this.drizzle.db

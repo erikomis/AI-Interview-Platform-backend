@@ -247,6 +247,7 @@ describe('Interview Entity', () => {
       expect(restored.experienceLevel).toBe(original.experienceLevel);
       expect(restored.sessionVariant).toBe(original.sessionVariant);
       expect(restored.maxQuestions).toBe(original.maxQuestions);
+      expect(restored.interviewer).toBe(original.interviewer);
       expect(restored.messages).toHaveLength(2);
       expect(restored.visionMetrics).toHaveLength(1);
       expect(restored.currentQuestion).toBe('Tell me about yourself');
@@ -260,8 +261,20 @@ describe('Interview Entity', () => {
       expect(() => Interview.fromJSON({ candidateId: 'John' })).toThrow('Invalid interview data');
     });
 
+    it('round-trips the interviewer persona', () => {
+      const original = new Interview('Ana', 'dev', 'pt', 'mid', 'user-1', 5, 'female');
+      const restored = Interview.fromJSON(JSON.parse(JSON.stringify(original)) as Record<string, unknown>);
+      expect(restored.interviewer).toBe('female');
+      expect(restored.maxQuestions).toBe(5);
+    });
+
+    it('falls back to the male persona for missing or unknown values', () => {
+      expect(Interview.fromJSON({ candidateId: 'John', role: 'dev', interviewer: 'robot' }).interviewer).toBe('male');
+    });
+
     it('defaults optional fields when absent', () => {
       const restored = Interview.fromJSON({ candidateId: 'John', role: 'dev' });
+      expect(restored.interviewer).toBe('male');
       expect(restored.language).toBe('pt');
       expect(restored.experienceLevel).toBe('mid');
       expect(restored.maxQuestions).toBe(10);

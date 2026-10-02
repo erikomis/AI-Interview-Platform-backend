@@ -1,6 +1,11 @@
 import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { ProcessAnswerUseCase } from './process-answer.use-case';
 import { Interview } from '../../../domain/entities/interview.entity';
+import {
+  AllQuestionsAnsweredException,
+  InterviewBusyException,
+  InterviewNotInProgressException,
+} from '../../errors/interview.errors';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -18,8 +23,8 @@ function dbChain(value: unknown): any {
 }
 
 /** Builds a serialised Interview that belongs to `userId`. */
-function makeInterviewJson(userId: string, interviewerMessages = 1): string {
-  const interview = new Interview('John', 'Engineer', 'en', 'mid', userId, 10);
+function makeInterviewJson(userId: string, interviewerMessages = 1, interviewer: 'male' | 'female' = 'male'): string {
+  const interview = new Interview('John', 'Engineer', 'en', 'mid', userId, 10, interviewer);
   interview.start();
   // Realistic history: every question except the current one has been answered.
   for (let i = 0; i < interviewerMessages; i++) {
@@ -127,6 +132,16 @@ describe('ProcessAnswerUseCase', () => {
     const result = await sut.execute({ interviewId: INTERVIEW_ID, answer: 'ok', userId: USER_ID });
 
     expect(result.audioBase64).toBeNull();
+    expect(result.responseAudioBase64).toBeNull();
+  });
+
+  it('voices the evaluation as well as the next question', async () => {
+    ttsService.synthesize.mockImplementation(async (text: string) => Buffer.from(`voice:${text}`));
+    const sut = makeSut(makeRedisHit());
+    const result = await sut.execute({ interviewId: INTERVIEW_ID, answer: 'ok', userId: USER_ID });
+
+    expect(Buffer.from(result.responseAudioBase64!, 'base64').toString()).toBe(`voice:${result.aiResponse}`);
+    expect(Buffer.from(result.audioBase64!, 'base64').toString()).toBe(`voice:${result.nextQuestion}`);
   });
 
   // ── isComplete logic ─────────────────────────────────────────────────────────
@@ -190,6 +205,7 @@ describe('ProcessAnswerUseCase', () => {
       status: 'in_progress',
       sessionVariant: 1,
       maxQuestions: 10,
+      interviewer: 'female',
       createdAt: new Date(),
     };
     const dbMessages = [
@@ -206,6 +222,20 @@ describe('ProcessAnswerUseCase', () => {
     // DB status 'in_progress' maps to the domain enum and the last interviewer
     // message becomes the question being answered
     expect(aiService.evaluateAnswer).toHaveBeenCalledWith(expect.objectContaining({ question: 'Q1' }));
+    // The persona survives the Redis → Postgres fallback
+    expect(aiService.evaluateAnswer).toHaveBeenCalledWith(expect.objectContaining({ interviewer: 'female' }));
+  });
+
+  it('threads the interviewer persona to the AI and the TTS voice', async () => {
+    const sut = makeSut(makeRedisService(makeInterviewJson(USER_ID, 1, 'female')));
+    await sut.execute({ interviewId: INTERVIEW_ID, answer: 'My answer', userId: USER_ID });
+
+    expect(aiService.evaluateAnswer).toHaveBeenCalledWith(expect.objectContaining({ interviewer: 'female' }));
+    expect(aiService.generateQuestion).toHaveBeenCalledWith(expect.objectContaining({ interviewer: 'female' }));
+    expect(ttsService.synthesize).toHaveBeenCalledTimes(2);
+    for (const call of ttsService.synthesize.mock.calls) {
+      expect(call.slice(1)).toEqual(['en', 'female']);
+    }
   });
 
   it('rejects answers once the DB says the interview is completed', async () => {
@@ -267,6 +297,9 @@ describe('ProcessAnswerUseCase', () => {
     await expect(
       sut.execute({ interviewId: INTERVIEW_ID, answer: 'ok', userId: USER_ID }),
     ).rejects.toThrow(ConflictException);
+    await expect(
+      sut.execute({ interviewId: INTERVIEW_ID, answer: 'ok', userId: USER_ID }),
+    ).rejects.toBeInstanceOf(InterviewBusyException);
     expect(aiService.evaluateAnswer).not.toHaveBeenCalled();
     expect(redis.del).not.toHaveBeenCalled();
   });
@@ -294,6 +327,9 @@ describe('ProcessAnswerUseCase', () => {
     await expect(
       sut.execute({ interviewId: INTERVIEW_ID, answer: 'ok', userId: USER_ID }),
     ).rejects.toThrow(BadRequestException);
+    await expect(
+      sut.execute({ interviewId: INTERVIEW_ID, answer: 'ok', userId: USER_ID }),
+    ).rejects.toBeInstanceOf(InterviewNotInProgressException);
   });
 
   it('rejects extra answers once every question has been answered', async () => {
@@ -304,6 +340,9 @@ describe('ProcessAnswerUseCase', () => {
     await expect(
       sut.execute({ interviewId: INTERVIEW_ID, answer: 'one more', userId: USER_ID }),
     ).rejects.toThrow(BadRequestException);
+    await expect(
+      sut.execute({ interviewId: INTERVIEW_ID, answer: 'one more', userId: USER_ID }),
+    ).rejects.toBeInstanceOf(AllQuestionsAnsweredException);
   });
 
   it('passes maxQuestions to the question generator', async () => {

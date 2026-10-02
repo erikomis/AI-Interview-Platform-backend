@@ -166,6 +166,7 @@ describe('GenerateFeedbackUseCase', () => {
         candidateName: 'John',
         experienceLevel: 'mid',
         language: 'en',
+        interviewer: 'male',
       }),
     );
   });

@@ -1,12 +1,4 @@
-import {
-  Injectable,
-  Inject,
-  Optional,
-  ForbiddenException,
-  BadRequestException,
-  ConflictException,
-  Logger,
-} from '@nestjs/common';
+import { Injectable, Inject, Optional, ForbiddenException, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { Interview, InterviewFeedback } from '../../../domain/entities/interview.entity';
 import { InterviewStatus } from '../../../domain/value-objects/interview-status.vo';
@@ -24,6 +16,7 @@ import {
   interviewLockKey,
   loadInterview,
 } from '../../services/interview-store';
+import { InterviewBusyException, InterviewNotInProgressException } from '../../errors/interview.errors';
 
 // Feedback is a single (long) LLM call — keep the lock comfortably above its 120s timeout
 const LOCK_TTL_SECONDS = 180;
@@ -55,7 +48,7 @@ export class GenerateFeedbackUseCase {
     if (stored) return stored;
 
     if (interview.status !== InterviewStatus.IN_PROGRESS) {
-      throw new BadRequestException('Interview is not in progress');
+      throw new InterviewNotInProgressException();
     }
 
     // Shares the per-interview lock with ProcessAnswer: no feedback while an
@@ -63,7 +56,7 @@ export class GenerateFeedbackUseCase {
     const lockKey = interviewLockKey(interview.id);
     const acquired = await this.redisService.setNx(lockKey, randomUUID(), LOCK_TTL_SECONDS);
     if (!acquired) {
-      throw new ConflictException('This interview is busy — try again shortly');
+      throw new InterviewBusyException();
     }
 
     try {
@@ -82,6 +75,7 @@ export class GenerateFeedbackUseCase {
       experienceLevel: interview.experienceLevel,
       sessionVariant: interview.sessionVariant,
       language: interview.language,
+      interviewer: interview.interviewer,
     });
 
     interview.complete(fb);

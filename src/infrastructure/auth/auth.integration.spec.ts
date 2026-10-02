@@ -329,8 +329,9 @@ describe('Auth — full integration flow', () => {
 
       await refreshTokenUC.execute(userId, refreshToken);
 
-      const { UnauthorizedException } = await import('@nestjs/common');
-      await expect(refreshTokenUC.execute(userId, refreshToken)).rejects.toThrow(UnauthorizedException);
+      // 409, not 401: the client retries /auth/me with the winner's cookies
+      const { ConflictException } = await import('@nestjs/common');
+      await expect(refreshTokenUC.execute(userId, refreshToken)).rejects.toThrow(ConflictException);
 
       // The token issued by the first (winning) rotation is still valid
       const active = await sql`SELECT id FROM refresh_tokens WHERE user_id = ${userId} AND revoked = false`;

@@ -3,6 +3,12 @@ import { InterviewStatus } from '../value-objects/interview-status.vo';
 
 export type Language = 'pt' | 'en';
 export type ExperienceLevel = 'junior' | 'mid' | 'senior';
+/** Interviewer persona: drives the name in the AI prompts and the TTS voice. */
+export type Interviewer = 'male' | 'female';
+
+export function toInterviewer(value: unknown): Interviewer {
+  return value === 'female' ? 'female' : 'male';
+}
 
 export interface VisionMetrics {
   eye_contact: number;
@@ -26,6 +32,7 @@ export class Interview {
   readonly role: string;
   readonly language: Language;
   readonly experienceLevel: ExperienceLevel;
+  readonly interviewer: Interviewer;
   readonly sessionVariant: number;
   readonly maxQuestions: number;
   status: InterviewStatus;
@@ -43,6 +50,7 @@ export class Interview {
     experienceLevel: ExperienceLevel = 'mid',
     userId?: string,
     maxQuestionsParam?: number,
+    interviewer: Interviewer = 'male',
   ) {
     this.id = uuidv4();
     this.userId = userId ?? uuidv4();
@@ -50,6 +58,7 @@ export class Interview {
     this.role = role;
     this.language = language;
     this.experienceLevel = experienceLevel;
+    this.interviewer = interviewer;
     this.sessionVariant = Math.floor(Math.random() * 3) + 1;
     this.maxQuestions = maxQuestionsParam ?? 10;
     this.status = InterviewStatus.PENDING;
@@ -100,6 +109,8 @@ export class Interview {
       (data.language as Language) ?? 'pt',
       (data.experienceLevel as ExperienceLevel) ?? 'mid',
       typeof data.userId === 'string' ? data.userId : undefined,
+      undefined,
+      toInterviewer(data.interviewer),
     );
     Object.assign(interview, {
       id: typeof data.id === 'string' ? data.id : interview.id,

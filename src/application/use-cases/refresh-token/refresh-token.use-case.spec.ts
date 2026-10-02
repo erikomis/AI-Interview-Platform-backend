@@ -1,4 +1,4 @@
-import { UnauthorizedException } from '@nestjs/common';
+import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import { RefreshTokenUseCase } from './refresh-token.use-case';
 import { hashToken } from '../../../infrastructure/auth/token.utils';
 
@@ -117,23 +117,26 @@ describe('RefreshTokenUseCase', () => {
     expect(tokenService.revokeAllUserTokens).toHaveBeenCalledWith('user-abc');
   });
 
-  it('rejects WITHOUT revoking all sessions when the token was rotated within the grace window', async () => {
+  it('rejects with 409 WITHOUT revoking all sessions when the token was rotated within the grace window', async () => {
     const justNow = new Date(Date.now() - 5_000);
     const drizzle = makeDrizzle([{ ...fakeStoredToken, revoked: true, revokedAt: justNow }], [fakeUser]);
     const tokenService = makeTokenService();
     const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
 
-    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+    const err = await sut.execute('user-abc', 'valid-raw-token').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect((err as ConflictException).getStatus()).toBe(409);
+    expect((err as ConflictException).message).toBe('Token already rotated');
     expect(tokenService.revokeAllUserTokens).not.toHaveBeenCalled();
     expect(tokenService.issueTokens).not.toHaveBeenCalled();
   });
 
-  it('rejects the loser of a concurrent rotation (atomic UPDATE matched no row)', async () => {
+  it('rejects the loser of a concurrent rotation with 409 (atomic UPDATE matched no row)', async () => {
     const drizzle = makeDrizzle([fakeStoredToken], [fakeUser], []);
     const tokenService = makeTokenService();
     const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
 
-    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(ConflictException);
     expect(tokenService.revokeAllUserTokens).not.toHaveBeenCalled();
     expect(tokenService.issueTokens).not.toHaveBeenCalled();
   });

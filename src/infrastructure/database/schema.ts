@@ -39,6 +39,7 @@ export const interviews = pgTable('interviews', {
   role: text('role').notNull(),
   language: text('language').notNull().default('pt'),
   experienceLevel: text('experience_level').notNull().default('mid'),
+  interviewer: text('interviewer').notNull().default('male'),
   status: text('status').notNull().default('pending'),
   sessionVariant: integer('session_variant').notNull().default(1),
   maxQuestions: integer('max_questions').notNull().default(10),

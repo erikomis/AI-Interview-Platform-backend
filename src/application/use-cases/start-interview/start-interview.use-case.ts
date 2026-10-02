@@ -1,4 +1,6 @@
 import { Injectable, Inject } from '@nestjs/common';
+import { speakBestEffort } from '../../services/speech';
+import { WordTiming } from '../../../domain/interfaces/tts.interface';
 import { Interview } from '../../../domain/entities/interview.entity';
 import { IAIService } from '../../../domain/interfaces/ai.interface';
 import { ITTSService } from '../../../domain/interfaces/tts.interface';
@@ -17,6 +19,8 @@ export interface StartInterviewResult {
   interview: Interview;
   firstQuestion: string;
   audioBase64: string | null;
+  /** Word timings of `audioBase64`, for the avatar's lip-sync */
+  words: WordTiming[];
 }
 
 @Injectable()
@@ -42,6 +46,7 @@ export class StartInterviewUseCase {
       dto.experienceLevel ?? 'mid',
       userId,
       maxQuestions,
+      dto.interviewer ?? 'male',
     );
     interview.start();
 
@@ -68,6 +73,7 @@ export class StartInterviewUseCase {
       cvContext: dto.cvSummary,
       previousTopics,
       maxQuestions: interview.maxQuestions,
+      interviewer: interview.interviewer,
     });
 
     interview.setCurrentQuestion(firstQuestion);
@@ -81,6 +87,7 @@ export class StartInterviewUseCase {
       role: interview.role,
       language: interview.language,
       experienceLevel: interview.experienceLevel,
+      interviewer: interview.interviewer,
       status: 'in_progress',
       sessionVariant: interview.sessionVariant,
       maxQuestions: interview.maxQuestions,
@@ -93,14 +100,8 @@ export class StartInterviewUseCase {
     // Save to Redis for fast access during interview
     await this.redisService.set(interviewCacheKey(interview.id), JSON.stringify(interview), INTERVIEW_CACHE_TTL);
 
-    let audioBase64: string | null = null;
-    try {
-      const audioBuffer = await this.ttsService.synthesize(firstQuestion, interview.language);
-      if (audioBuffer) audioBase64 = audioBuffer.toString('base64');
-    } catch {
-      // TTS is best-effort
-    }
+    const speech = await speakBestEffort(this.ttsService, firstQuestion, interview.language, interview.interviewer);
 
-    return { interview, firstQuestion, audioBase64 };
+    return { interview, firstQuestion, audioBase64: speech.audioBase64, words: speech.words };
   }
 }

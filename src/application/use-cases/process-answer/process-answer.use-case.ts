@@ -1,13 +1,8 @@
-import {
-  Injectable,
-  Inject,
-  ForbiddenException,
-  BadRequestException,
-  ConflictException,
-  Logger,
-} from '@nestjs/common';
+import { Injectable, Inject, ForbiddenException, Logger } from '@nestjs/common';
+import { speakBestEffort } from '../../services/speech';
+import { WordTiming } from '../../../domain/interfaces/tts.interface';
 import { randomUUID } from 'crypto';
-import { Interview } from '../../../domain/entities/interview.entity';
+import { Interview, Interviewer } from '../../../domain/entities/interview.entity';
 import { InterviewStatus } from '../../../domain/value-objects/interview-status.vo';
 import { IAIService } from '../../../domain/interfaces/ai.interface';
 import { ITTSService } from '../../../domain/interfaces/tts.interface';
@@ -21,11 +16,21 @@ import {
   loadInterview,
   persistInterviewMessages,
 } from '../../services/interview-store';
+import {
+  AllQuestionsAnsweredException,
+  InterviewBusyException,
+  InterviewNotInProgressException,
+} from '../../errors/interview.errors';
 
 export interface ProcessAnswerResult {
   aiResponse: string;
   nextQuestion: string | null;
   audioBase64: string | null;
+  /** Word timings of `audioBase64` (lip-sync) */
+  words: WordTiming[];
+  /** Spoken version of `aiResponse` (null when TTS is unavailable) */
+  responseAudioBase64: string | null;
+  responseWords: WordTiming[];
   isComplete: boolean;
 }
 
@@ -43,22 +48,27 @@ export class ProcessAnswerUseCase {
     private readonly drizzleService: DrizzleService,
   ) {}
 
+  /** Loads the interview (Redis, then PostgreSQL) and verifies it belongs to `userId`. */
+  async loadOwnedInterview(interviewId: string, userId: string): Promise<Interview> {
+    const interview = await loadInterview(this.redisService, this.drizzleService, interviewId);
+    if (interview.userId !== userId) {
+      throw new ForbiddenException('Access denied to this interview');
+    }
+    return interview;
+  }
+
   /**
    * Loads the interview and verifies it belongs to `userId` and still accepts answers.
    * Exposed so callers can fail fast (e.g. before running STT on an audio answer).
    */
   async loadAnswerableInterview(interviewId: string, userId: string): Promise<Interview> {
-    const interview = await loadInterview(this.redisService, this.drizzleService, interviewId);
-
-    if (interview.userId !== userId) {
-      throw new ForbiddenException('Access denied to this interview');
-    }
+    const interview = await this.loadOwnedInterview(interviewId, userId);
     if (interview.status !== InterviewStatus.IN_PROGRESS) {
-      throw new BadRequestException('Interview is not in progress');
+      throw new InterviewNotInProgressException();
     }
     const answered = interview.messages.filter((m) => m.role === 'candidate').length;
     if (answered >= interview.maxQuestions) {
-      throw new BadRequestException('All questions have been answered — request feedback instead');
+      throw new AllQuestionsAnsweredException();
     }
     return interview;
   }
@@ -69,7 +79,7 @@ export class ProcessAnswerUseCase {
     const lockKey = interviewLockKey(dto.interviewId);
     const acquired = await this.redisService.setNx(lockKey, randomUUID(), LOCK_TTL_SECONDS);
     if (!acquired) {
-      throw new ConflictException('An answer for this interview is already being processed');
+      throw new InterviewBusyException('An answer for this interview is already being processed');
     }
 
     try {
@@ -94,6 +104,7 @@ export class ProcessAnswerUseCase {
       role: interview.role,
       visionMetrics: interview.getAverageVisionMetrics(),
       language: interview.language,
+      interviewer: interview.interviewer,
     });
 
     interview.addMessage('interviewer', aiResponse);
@@ -101,7 +112,6 @@ export class ProcessAnswerUseCase {
     const isComplete = interview.messages.filter((m) => m.role === 'candidate').length >= interview.maxQuestions;
 
     let nextQuestion: string | null = null;
-    let audioBase64: string | null = null;
 
     if (!isComplete) {
       nextQuestion = await this.aiService.generateQuestion({
@@ -113,6 +123,7 @@ export class ProcessAnswerUseCase {
         experienceLevel: interview.experienceLevel,
         sessionVariant: interview.sessionVariant,
         maxQuestions: interview.maxQuestions,
+        interviewer: interview.interviewer,
       });
 
       interview.setCurrentQuestion(nextQuestion);
@@ -133,15 +144,23 @@ export class ProcessAnswerUseCase {
       INTERVIEW_CACHE_TTL,
     );
 
-    if (nextQuestion) {
-      try {
-        const audioBuffer = await this.ttsService.synthesize(nextQuestion, interview.language);
-        if (audioBuffer) audioBase64 = audioBuffer.toString('base64');
-      } catch {
-        // TTS is best-effort
-      }
-    }
+    // Voice both the evaluation and the next question with the same neural
+    // voice, in parallel, so the browser never falls back to robotic speech.
+    const [response, question] = await Promise.all([
+      speakBestEffort(this.ttsService, aiResponse, interview.language, interview.interviewer),
+      nextQuestion
+        ? speakBestEffort(this.ttsService, nextQuestion, interview.language, interview.interviewer)
+        : Promise.resolve({ audioBase64: null, words: [] }),
+    ]);
 
-    return { aiResponse, nextQuestion, audioBase64, isComplete };
+    return {
+      aiResponse,
+      nextQuestion,
+      audioBase64: question.audioBase64,
+      words: question.words,
+      responseAudioBase64: response.audioBase64,
+      responseWords: response.words,
+      isComplete,
+    };
   }
 }

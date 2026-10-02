@@ -57,6 +57,7 @@ export class DrizzleService implements OnModuleInit, OnModuleDestroy {
         role              TEXT NOT NULL,
         language          TEXT NOT NULL DEFAULT 'pt',
         experience_level  TEXT NOT NULL DEFAULT 'mid',
+        interviewer       TEXT NOT NULL DEFAULT 'male',
         status            TEXT NOT NULL DEFAULT 'pending',
         session_variant   INTEGER NOT NULL DEFAULT 1,
         max_questions     INTEGER NOT NULL DEFAULT 10,
@@ -101,6 +102,7 @@ export class DrizzleService implements OnModuleInit, OnModuleDestroy {
     await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS candidate_name TEXT`;
     await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS topics_covered JSONB`;
     await this.sql`ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`;
+    await this.sql`ALTER TABLE interviews ADD COLUMN IF NOT EXISTS interviewer TEXT NOT NULL DEFAULT 'male'`;
 
     this.logger.log('Database tables ready');
   }

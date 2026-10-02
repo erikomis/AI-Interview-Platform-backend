@@ -1,11 +1,13 @@
-import { ArgumentsHost, Catch, HttpException, Logger } from '@nestjs/common';
-import { BaseWsExceptionFilter, WsException } from '@nestjs/websockets';
+import { ArgumentsHost, Catch, Logger } from '@nestjs/common';
+import { BaseWsExceptionFilter } from '@nestjs/websockets';
 import { Socket } from 'socket.io';
+import { toWsError } from './ws-error';
 
 /**
  * Surfaces any exception escaping a gateway handler (validation errors, guards,
  * unexpected throws) with the same `error` event shape the handlers emit
- * themselves: `{ message: string }`. Nest's default emits `exception` instead.
+ * themselves: `{ message: string, code: WsErrorCode }`. Nest's default emits
+ * `exception` instead.
  */
 @Catch()
 export class WsErrorFilter extends BaseWsExceptionFilter {
@@ -13,18 +15,10 @@ export class WsErrorFilter extends BaseWsExceptionFilter {
 
   catch(exception: unknown, host: ArgumentsHost) {
     const client = host.switchToWs().getClient<Socket>();
-    client.emit('error', { message: this.messageOf(exception) });
-  }
-
-  private messageOf(exception: unknown): string {
-    if (exception instanceof WsException) {
-      const err = exception.getError();
-      if (typeof err === 'string') return err;
-      if (err && typeof err === 'object' && 'message' in err) return String((err as { message: unknown }).message);
-      return 'Invalid request';
+    const payload = toWsError(exception);
+    if (payload.code === 'INTERNAL') {
+      this.logger.error('Unhandled WS exception', exception instanceof Error ? exception.stack : String(exception));
     }
-    if (exception instanceof HttpException) return exception.message;
-    this.logger.error('Unhandled WS exception', exception instanceof Error ? exception.stack : String(exception));
-    return 'Internal server error';
+    client.emit('error', payload);
   }
 }

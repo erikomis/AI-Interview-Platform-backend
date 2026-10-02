@@ -17,6 +17,7 @@ import { Type } from 'class-transformer';
 const LANGUAGES = ['pt', 'en'] as const;
 const EXPERIENCE_LEVELS = ['junior', 'mid', 'senior'] as const;
 const SESSION_MODES = ['practice', 'full', 'intensive'] as const;
+const INTERVIEWERS = ['male', 'female'] as const;
 
 export const MAX_ANSWER_LENGTH = 10_000;
 export const MAX_CV_LENGTH = 4000;
@@ -43,6 +44,11 @@ export class CreateInterviewDto {
   @IsOptional()
   @IsIn(SESSION_MODES)
   sessionMode?: 'practice' | 'full' | 'intensive';
+
+  /** Interviewer persona — male ("Alex") or female ("Sofia"); defaults to male. */
+  @IsOptional()
+  @IsIn(INTERVIEWERS)
+  interviewer?: 'male' | 'female';
 
   @IsOptional()
   @IsString()
@@ -121,6 +127,11 @@ export class WsStartInterviewDto {
   @IsOptional()
   @IsIn(SESSION_MODES)
   sessionMode?: 'practice' | 'full' | 'intensive';
+
+  /** Interviewer persona — male ("Alex") or female ("Sofia"); defaults to male. */
+  @IsOptional()
+  @IsIn(INTERVIEWERS)
+  interviewer?: 'male' | 'female';
 
   @IsOptional()
   @IsString()

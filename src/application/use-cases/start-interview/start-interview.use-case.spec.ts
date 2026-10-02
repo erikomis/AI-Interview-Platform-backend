@@ -134,6 +134,24 @@ describe('StartInterviewUseCase', () => {
     expect(result.interview.maxQuestions).toBe(expected);
   });
 
+  it('defaults to the male interviewer persona', async () => {
+    const result = await sut.execute(baseDto);
+
+    expect(result.interview.interviewer).toBe('male');
+    expect(aiService.generateQuestion).toHaveBeenCalledWith(expect.objectContaining({ interviewer: 'male' }));
+    expect(ttsService.synthesize).toHaveBeenCalledWith('Tell me about yourself', 'en', 'male');
+  });
+
+  it('stores the chosen persona and voices the first question with it', async () => {
+    const result = await sut.execute({ ...baseDto, interviewer: 'female' });
+
+    expect(result.interview.interviewer).toBe('female');
+    expect(aiService.generateQuestion).toHaveBeenCalledWith(expect.objectContaining({ interviewer: 'female' }));
+    expect(drizzleService._insertChain.values).toHaveBeenCalledWith(expect.objectContaining({ interviewer: 'female' }));
+    expect(ttsService.synthesize).toHaveBeenCalledWith('Tell me about yourself', 'en', 'female');
+    expect(JSON.parse(redisService.set.mock.calls[0][1] as string).interviewer).toBe('female');
+  });
+
   it('returns audioBase64 when TTS succeeds', async () => {
     const result = await sut.execute(baseDto);
     expect(result.audioBase64).toBe(Buffer.from('audio-data').toString('base64'));

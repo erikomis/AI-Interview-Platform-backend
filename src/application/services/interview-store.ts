@@ -79,6 +79,7 @@ export async function reconstructInterviewFromDb(
     role: row.role,
     language: row.language,
     experienceLevel: row.experienceLevel,
+    interviewer: row.interviewer,
     status: interviewStatusFromDb(row.status),
     sessionVariant: row.sessionVariant,
     maxQuestions: row.maxQuestions ?? 10,
