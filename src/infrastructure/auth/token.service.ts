@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, lt } from 'drizzle-orm';
 import { DrizzleService } from '../database/drizzle.service';
 import { refreshTokens } from '../database/schema';
 import { hashToken } from './token.utils';
@@ -48,20 +48,23 @@ export class TokenService {
     const tokenHash = hashToken(rawToken);
     await this.drizzle.db
       .update(refreshTokens)
-      .set({ revoked: true })
+      .set({ revoked: true, revokedAt: new Date() })
       .where(and(eq(refreshTokens.userId, userId), eq(refreshTokens.tokenHash, tokenHash)));
   }
 
   async revokeAllUserTokens(userId: string) {
     await this.drizzle.db
       .update(refreshTokens)
-      .set({ revoked: true })
-      .where(eq(refreshTokens.userId, userId));
+      .set({ revoked: true, revokedAt: new Date() })
+      // Leave already-revoked rows untouched so their original revokedAt is preserved
+      .where(and(eq(refreshTokens.userId, userId), eq(refreshTokens.revoked, false)));
   }
 
+  // Only purge rows past their expiry: revoked-but-unexpired rows must remain so a
+  // replayed (stolen) refresh token is recognised as reuse rather than "unknown".
   private async cleanupRevokedTokens(userId: string) {
     await this.drizzle.db
       .delete(refreshTokens)
-      .where(and(eq(refreshTokens.userId, userId), eq(refreshTokens.revoked, true)));
+      .where(and(eq(refreshTokens.userId, userId), lt(refreshTokens.expiresAt, new Date())));
   }
 }

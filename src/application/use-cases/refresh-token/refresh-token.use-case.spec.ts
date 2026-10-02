@@ -26,13 +26,22 @@ const fakeStoredToken = {
   expiresAt: new Date(Date.now() + 86400_000),
 };
 
-const makeDrizzle = (tokenRows: unknown[] = [fakeStoredToken], userRows: unknown[] = [fakeUser]) => ({
+const makeDrizzle = (
+  tokenRows: unknown[] = [fakeStoredToken],
+  userRows: unknown[] = [fakeUser],
+  rotatedRows: unknown[] = [{ id: fakeStoredToken.id }],
+) => ({
   db: {
     select: jest.fn()
       .mockReturnValueOnce(dbChain(tokenRows))
       .mockReturnValueOnce(dbChain(userRows)),
+    // UPDATE ... WHERE id = ? AND revoked = false RETURNING id
     update: jest.fn().mockReturnValue({
-      set: jest.fn().mockReturnValue({ where: jest.fn().mockResolvedValue([]) }),
+      set: jest.fn().mockReturnValue({
+        where: jest.fn().mockReturnValue({
+          returning: jest.fn().mockResolvedValue(rotatedRows),
+        }),
+      }),
     }),
   },
 });
@@ -70,12 +79,23 @@ describe('RefreshTokenUseCase', () => {
     expect(drizzle.db.update).toHaveBeenCalled();
   });
 
-  it('revokes ALL user tokens and throws on invalid token (reuse attack)', async () => {
-    const drizzle = makeDrizzle([], [fakeUser]); // empty token rows = invalid token
+  it('throws on unknown token without revoking other sessions', async () => {
+    const drizzle = makeDrizzle([], [fakeUser]); // empty token rows = unknown token
     const tokenService = makeTokenService();
     const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
 
     await expect(sut.execute('user-abc', 'invalid-token')).rejects.toThrow(UnauthorizedException);
+    expect(tokenService.revokeAllUserTokens).not.toHaveBeenCalled();
+    expect(tokenService.issueTokens).not.toHaveBeenCalled();
+  });
+
+  it('revokes ALL user tokens and throws when a revoked token is reused (reuse attack)', async () => {
+    const revokedLongAgo = new Date(Date.now() - 5 * 60_000);
+    const drizzle = makeDrizzle([{ ...fakeStoredToken, revoked: true, revokedAt: revokedLongAgo }], [fakeUser]);
+    const tokenService = makeTokenService();
+    const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
+
+    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
     expect(tokenService.revokeAllUserTokens).toHaveBeenCalledWith('user-abc');
     expect(tokenService.issueTokens).not.toHaveBeenCalled();
   });
@@ -86,5 +106,44 @@ describe('RefreshTokenUseCase', () => {
     const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
 
     await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+  });
+
+  it('treats a legacy revoked token without revokedAt as reuse', async () => {
+    const drizzle = makeDrizzle([{ ...fakeStoredToken, revoked: true, revokedAt: null }], [fakeUser]);
+    const tokenService = makeTokenService();
+    const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
+
+    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+    expect(tokenService.revokeAllUserTokens).toHaveBeenCalledWith('user-abc');
+  });
+
+  it('rejects WITHOUT revoking all sessions when the token was rotated within the grace window', async () => {
+    const justNow = new Date(Date.now() - 5_000);
+    const drizzle = makeDrizzle([{ ...fakeStoredToken, revoked: true, revokedAt: justNow }], [fakeUser]);
+    const tokenService = makeTokenService();
+    const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
+
+    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+    expect(tokenService.revokeAllUserTokens).not.toHaveBeenCalled();
+    expect(tokenService.issueTokens).not.toHaveBeenCalled();
+  });
+
+  it('rejects the loser of a concurrent rotation (atomic UPDATE matched no row)', async () => {
+    const drizzle = makeDrizzle([fakeStoredToken], [fakeUser], []);
+    const tokenService = makeTokenService();
+    const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
+
+    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+    expect(tokenService.revokeAllUserTokens).not.toHaveBeenCalled();
+    expect(tokenService.issueTokens).not.toHaveBeenCalled();
+  });
+
+  it('rejects an expired (non-revoked) token', async () => {
+    const drizzle = makeDrizzle([{ ...fakeStoredToken, expiresAt: new Date(Date.now() - 1000) }]);
+    const tokenService = makeTokenService();
+    const sut = new RefreshTokenUseCase(drizzle as any, tokenService as any);
+
+    await expect(sut.execute('user-abc', 'valid-raw-token')).rejects.toThrow(UnauthorizedException);
+    expect(drizzle.db.update).not.toHaveBeenCalled();
   });
 });

@@ -44,6 +44,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
       token_hash  TEXT NOT NULL UNIQUE,
       expires_at  TIMESTAMPTZ NOT NULL,
       revoked     BOOLEAN NOT NULL DEFAULT FALSE,
+      revoked_at  TIMESTAMPTZ,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `;
@@ -303,6 +304,9 @@ describe('Auth — full integration flow', () => {
       // First use — valid
       await refreshTokenUC.execute(userId, refreshToken);
 
+      // Push the rotation outside the 30s grace window so the replay counts as an attack
+      await sql`UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '5 minutes' WHERE user_id = ${userId} AND revoked = true`;
+
       // Second use of the SAME token — reuse attack
       const { UnauthorizedException } = await import('@nestjs/common');
       await expect(
@@ -312,6 +316,25 @@ describe('Auth — full integration flow', () => {
       // All tokens for that user must be revoked
       const tokens = await sql`SELECT revoked FROM refresh_tokens WHERE user_id = ${userId}`;
       expect(tokens.every((t: Record<string, unknown>) => t.revoked)).toBe(true);
+    });
+
+    it('rejects a token replayed within the grace window WITHOUT revoking other sessions', async () => {
+      const { refreshToken } = await registerUC.execute({
+        name: 'Gina',
+        email: 'gina@test.com',
+        password: 'Password1!',
+      });
+      const userRow = await sql`SELECT id FROM users WHERE email = 'gina@test.com'`;
+      const userId = userRow[0].id as string;
+
+      await refreshTokenUC.execute(userId, refreshToken);
+
+      const { UnauthorizedException } = await import('@nestjs/common');
+      await expect(refreshTokenUC.execute(userId, refreshToken)).rejects.toThrow(UnauthorizedException);
+
+      // The token issued by the first (winning) rotation is still valid
+      const active = await sql`SELECT id FROM refresh_tokens WHERE user_id = ${userId} AND revoked = false`;
+      expect(active.length).toBe(1);
     });
   });
 

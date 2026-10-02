@@ -79,7 +79,9 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const ip = (req.headers['x-forwarded-for'] as string) || req.ip || '0.0.0.0';
+    // req.ip honours X-Forwarded-For only when 'trust proxy' is enabled (TRUST_PROXY=true
+    // in main.ts) — reading the raw header would let clients spoof their IP and dodge lockout.
+    const ip = req.ip || '0.0.0.0';
     const { accessToken, refreshToken } = await this.login.execute(dto, ip);
     res.cookie('refresh_token', refreshToken, REFRESH_COOKIE_OPTIONS);
     res.cookie('access_token', accessToken, ACCESS_COOKIE_OPTIONS);
