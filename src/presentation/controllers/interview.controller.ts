@@ -11,7 +11,8 @@ import {
   HttpStatus,
   Inject,
   ForbiddenException,
-  NotFoundException,
+  BadRequestException,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../infrastructure/auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../decorators/current-user.decorator';
@@ -19,13 +20,16 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { StartInterviewUseCase } from '../../application/use-cases/start-interview/start-interview.use-case';
 import { ProcessAnswerUseCase } from '../../application/use-cases/process-answer/process-answer.use-case';
 import { GenerateFeedbackUseCase } from '../../application/use-cases/generate-feedback/generate-feedback.use-case';
-import { CreateInterviewDto, ProcessAnswerDto } from '../../application/dtos/interview.dto';
+import { CreateInterviewDto, ProcessAnswerBodyDto, UpdateCvDto } from '../../application/dtos/interview.dto';
 import { ISTTService } from '../../domain/interfaces/stt.interface';
 import { RedisService } from '../../infrastructure/database/redis.service';
 import { DrizzleService } from '../../infrastructure/database/drizzle.service';
-import { Interview } from '../../domain/entities/interview.entity';
 import { interviews, feedback, users } from '../../infrastructure/database/schema';
-import { eq, desc } from 'drizzle-orm';
+import { eq, desc, and } from 'drizzle-orm';
+import { findStoredFeedback, loadInterview } from '../../application/services/interview-store';
+
+// Audio answers: ~10MB is several minutes of compressed speech
+const MAX_AUDIO_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 @Controller('interviews')
 @UseGuards(JwtAuthGuard)
@@ -77,27 +81,31 @@ export class InterviewController {
         clarity: feedback.clarity,
       })
       .from(interviews)
-      .leftJoin(feedback, eq(feedback.interviewId, interviews.id))
-      .where(eq(interviews.userId, userId))
-      .orderBy(interviews.createdAt)
+      .innerJoin(feedback, eq(feedback.interviewId, interviews.id))
+      .where(and(eq(interviews.userId, userId), eq(interviews.status, 'completed')))
+      // Latest 20 completed sessions, then back to chronological order for charts
+      .orderBy(desc(interviews.createdAt))
       .limit(20);
 
-    const completed = rows.filter((r) => r.overall !== null);
+    const completed = rows.reverse();
 
     if (completed.length === 0) {
       return { hasData: false, sessions: [], averages: null };
     }
 
-    const sum = (key: 'overall' | 'technical' | 'communication' | 'confidence' | 'clarity') =>
-      completed.reduce((acc, r) => acc + (r[key] ?? 0), 0);
+    // Ignore non-finite scores so one malformed row can't turn an average into NaN
+    const avg = (key: 'overall' | 'technical' | 'communication' | 'confidence' | 'clarity') => {
+      const values = completed.map((r) => r[key]).filter((v): v is number => Number.isFinite(v));
+      return values.length > 0 ? +(values.reduce((a, b) => a + b, 0) / values.length).toFixed(1) : null;
+    };
 
     const count = completed.length;
     const averages = {
-      overall:       +(sum('overall')       / count).toFixed(1),
-      technical:     +(sum('technical')     / count).toFixed(1),
-      communication: +(sum('communication') / count).toFixed(1),
-      confidence:    +(sum('confidence')    / count).toFixed(1),
-      clarity:       +(sum('clarity')       / count).toFixed(1),
+      overall:       avg('overall'),
+      technical:     avg('technical'),
+      communication: avg('communication'),
+      confidence:    avg('confidence'),
+      clarity:       avg('clarity'),
     };
 
     const sessions = completed.map((r, i) => ({
@@ -118,12 +126,12 @@ export class InterviewController {
   @Post('me/cv')
   @HttpCode(HttpStatus.OK)
   async updateCv(
-    @Body() body: { cvSummary: string },
+    @Body() body: UpdateCvDto,
     @CurrentUser() currentUser: { userId: string },
   ) {
     await this.drizzleService.db
       .update(users)
-      .set({ cvSummary: body.cvSummary.slice(0, 4000) })
+      .set({ cvSummary: body.cvSummary })
       .where(eq(users.id, currentUser.userId));
     return { ok: true };
   }
@@ -133,8 +141,16 @@ export class InterviewController {
     const userId = currentUser.userId;
     const db = this.drizzleService.db;
 
+    // Explicit column list — never leak passwordHash or other internal fields
     const userRows = await db
-      .select()
+      .select({
+        id: users.id,
+        name: users.name,
+        email: users.email,
+        emailVerified: users.emailVerified,
+        cvSummary: users.cvSummary,
+        createdAt: users.createdAt,
+      })
       .from(users)
       .where(eq(users.id, userId))
       .limit(1);
@@ -171,37 +187,50 @@ export class InterviewController {
 
   @Get(':id')
   async getInterview(
-    @Param('id') interviewId: string,
+    @Param('id', ParseUUIDPipe) interviewId: string,
     @CurrentUser() currentUser: { userId: string },
   ) {
-    const raw = await this.redisService.get(`interview:${interviewId}`);
-    if (!raw) throw new NotFoundException('Interview not found');
-    const data = JSON.parse(raw) as Record<string, unknown>;
-    if (data.userId !== currentUser.userId) throw new ForbiddenException();
-    return Interview.fromJSON(data);
+    // Redis while the session is live, PostgreSQL once the cache has expired
+    const interview = await loadInterview(this.redisService, this.drizzleService, interviewId);
+    if (interview.userId !== currentUser.userId) throw new ForbiddenException();
+    if (!interview.feedback) {
+      interview.feedback = await findStoredFeedback(this.drizzleService, interview.id);
+    }
+    return interview;
   }
 
   @Post(':id/answer')
   async processAnswer(
-    @Param('id') interviewId: string,
-    @Body() dto: ProcessAnswerDto,
+    @Param('id', ParseUUIDPipe) interviewId: string,
+    @Body() dto: ProcessAnswerBodyDto,
     @CurrentUser() currentUser: { userId: string },
   ) {
     return this.processAnswerUseCase.execute({
-      ...dto,
+      answer: dto.answer,
+      visionMetrics: dto.visionMetrics,
       interviewId,
       userId: currentUser.userId,
     });
   }
 
   @Post(':id/answer/audio')
-  @UseInterceptors(FileInterceptor('audio'))
+  @UseInterceptors(FileInterceptor('audio', { limits: { fileSize: MAX_AUDIO_UPLOAD_BYTES, files: 1 } }))
   async processAudioAnswer(
-    @Param('id') interviewId: string,
-    @UploadedFile() file: Express.Multer.File,
+    @Param('id', ParseUUIDPipe) interviewId: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
     @CurrentUser() currentUser: { userId: string },
   ) {
-    const transcript = await this.sttService.transcribe(file.buffer, file.mimetype);
+    if (!file || !file.buffer || file.size === 0) {
+      throw new BadRequestException('Missing "audio" file');
+    }
+
+    // Check ownership/state before spending STT time; transcribe in the interview's language
+    const interview = await this.processAnswerUseCase.loadAnswerableInterview(interviewId, currentUser.userId);
+    const transcript = (await this.sttService.transcribe(file.buffer, file.mimetype, interview.language)).trim();
+    if (!transcript) {
+      throw new BadRequestException('Could not understand the audio — please try again');
+    }
+
     const result = await this.processAnswerUseCase.execute({
       interviewId,
       answer: transcript,
@@ -212,7 +241,7 @@ export class InterviewController {
 
   @Post(':id/feedback')
   async generateFeedback(
-    @Param('id') interviewId: string,
+    @Param('id', ParseUUIDPipe) interviewId: string,
     @CurrentUser() currentUser: { userId: string },
   ) {
     return this.generateFeedbackUseCase.execute({

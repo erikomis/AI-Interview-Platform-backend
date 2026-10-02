@@ -8,6 +8,8 @@ export interface VisionMetrics {
   eye_contact: number;
   stress_level: number;
   confidence: number;
+  /** Set by the vision service; frames where no face was detected carry no signal. */
+  face_visible?: boolean;
 }
 
 export interface InterviewMessage {
@@ -122,21 +124,18 @@ export class Interview {
   }
 
   getAverageVisionMetrics(): VisionMetrics | null {
-    if (this.visionMetrics.length === 0) return null;
-    const total = this.visionMetrics.reduce(
-      (acc, m) => ({
-        eye_contact: acc.eye_contact + m.eye_contact,
-        stress_level: acc.stress_level + m.stress_level,
-        confidence: acc.confidence + m.confidence,
-      }),
-      { eye_contact: 0, stress_level: 0, confidence: 0 },
-    );
-    const count = this.visionMetrics.length;
-    return {
-      eye_contact: total.eye_contact / count,
-      stress_level: total.stress_level / count,
-      confidence: total.confidence / count,
+    // Ignore frames without a visible face and any non-finite values so a single
+    // bad sample can't turn the whole average into NaN.
+    const frames = this.visionMetrics.filter((m) => m && m.face_visible !== false);
+    const avg = (key: 'eye_contact' | 'stress_level' | 'confidence'): number | null => {
+      const values = frames.map((m) => m[key]).filter((v): v is number => Number.isFinite(v));
+      return values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null;
     };
+    const eye_contact = avg('eye_contact');
+    const stress_level = avg('stress_level');
+    const confidence = avg('confidence');
+    if (eye_contact === null || stress_level === null || confidence === null) return null;
+    return { eye_contact, stress_level, confidence };
   }
 }
 

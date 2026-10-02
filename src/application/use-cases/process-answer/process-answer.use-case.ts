@@ -1,12 +1,26 @@
-import { Injectable, Inject, NotFoundException, ForbiddenException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Inject,
+  ForbiddenException,
+  BadRequestException,
+  ConflictException,
+  Logger,
+} from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { Interview } from '../../../domain/entities/interview.entity';
+import { InterviewStatus } from '../../../domain/value-objects/interview-status.vo';
 import { IAIService } from '../../../domain/interfaces/ai.interface';
 import { ITTSService } from '../../../domain/interfaces/tts.interface';
 import { RedisService } from '../../../infrastructure/database/redis.service';
 import { DrizzleService } from '../../../infrastructure/database/drizzle.service';
-import { interviews, messages } from '../../../infrastructure/database/schema';
-import { eq, asc } from 'drizzle-orm';
 import { ProcessAnswerDto } from './process-answer.dto';
+import {
+  INTERVIEW_CACHE_TTL,
+  interviewCacheKey,
+  interviewLockKey,
+  loadInterview,
+  persistInterviewMessages,
+} from '../../services/interview-store';
 
 export interface ProcessAnswerResult {
   aiResponse: string;
@@ -14,6 +28,9 @@ export interface ProcessAnswerResult {
   audioBase64: string | null;
   isComplete: boolean;
 }
+
+// Upper bound for one answer: evaluate (≤120s) + next question (≤120s) + TTS (≤30s)
+const LOCK_TTL_SECONDS = 300;
 
 @Injectable()
 export class ProcessAnswerUseCase {
@@ -26,20 +43,44 @@ export class ProcessAnswerUseCase {
     private readonly drizzleService: DrizzleService,
   ) {}
 
-  async execute(dto: ProcessAnswerDto): Promise<ProcessAnswerResult> {
-    const raw = await this.redisService.get(`interview:${dto.interviewId}`);
-    let interview: Interview;
+  /**
+   * Loads the interview and verifies it belongs to `userId` and still accepts answers.
+   * Exposed so callers can fail fast (e.g. before running STT on an audio answer).
+   */
+  async loadAnswerableInterview(interviewId: string, userId: string): Promise<Interview> {
+    const interview = await loadInterview(this.redisService, this.drizzleService, interviewId);
 
-    if (raw) {
-      interview = Interview.fromJSON(JSON.parse(raw) as Record<string, unknown>);
-    } else {
-      // Fallback: reconstruct from DB when Redis TTL has expired
-      interview = await this.reconstructFromDb(dto.interviewId);
-    }
-
-    if (interview.userId !== dto.userId) {
+    if (interview.userId !== userId) {
       throw new ForbiddenException('Access denied to this interview');
     }
+    if (interview.status !== InterviewStatus.IN_PROGRESS) {
+      throw new BadRequestException('Interview is not in progress');
+    }
+    const answered = interview.messages.filter((m) => m.role === 'candidate').length;
+    if (answered >= interview.maxQuestions) {
+      throw new BadRequestException('All questions have been answered — request feedback instead');
+    }
+    return interview;
+  }
+
+  async execute(dto: ProcessAnswerDto): Promise<ProcessAnswerResult> {
+    // Serialise answers per interview: a double submit (or two tabs) must not
+    // evaluate the same question twice or interleave Redis/DB writes.
+    const lockKey = interviewLockKey(dto.interviewId);
+    const acquired = await this.redisService.setNx(lockKey, randomUUID(), LOCK_TTL_SECONDS);
+    if (!acquired) {
+      throw new ConflictException('An answer for this interview is already being processed');
+    }
+
+    try {
+      return await this.process(dto);
+    } finally {
+      await this.redisService.del(lockKey).catch(() => {/* expires via TTL */});
+    }
+  }
+
+  private async process(dto: ProcessAnswerDto): Promise<ProcessAnswerResult> {
+    const interview = await this.loadAnswerableInterview(dto.interviewId, dto.userId);
 
     if (dto.visionMetrics) {
       interview.addVisionMetrics(dto.visionMetrics);
@@ -71,11 +112,28 @@ export class ProcessAnswerUseCase {
         language: interview.language,
         experienceLevel: interview.experienceLevel,
         sessionVariant: interview.sessionVariant,
+        maxQuestions: interview.maxQuestions,
       });
 
       interview.setCurrentQuestion(nextQuestion);
       interview.addMessage('interviewer', nextQuestion);
+    }
 
+    // Persist durably first: if this fails, Redis is left untouched and the
+    // candidate can simply resubmit the same answer.
+    await persistInterviewMessages(this.drizzleService, interview.id, [
+      { role: 'candidate', content: dto.answer },
+      { role: 'interviewer', content: aiResponse },
+      ...(nextQuestion ? [{ role: 'interviewer' as const, content: nextQuestion }] : []),
+    ]);
+
+    await this.redisService.set(
+      interviewCacheKey(interview.id),
+      JSON.stringify(interview),
+      INTERVIEW_CACHE_TTL,
+    );
+
+    if (nextQuestion) {
       try {
         const audioBuffer = await this.ttsService.synthesize(nextQuestion, interview.language);
         if (audioBuffer) audioBase64 = audioBuffer.toString('base64');
@@ -84,49 +142,6 @@ export class ProcessAnswerUseCase {
       }
     }
 
-    await this.redisService.set(
-      `interview:${interview.id}`,
-      JSON.stringify(interview),
-      3600,
-    );
-
     return { aiResponse, nextQuestion, audioBase64, isComplete };
-  }
-
-  private async reconstructFromDb(interviewId: string): Promise<Interview> {
-    const db = this.drizzleService.db;
-    const rows = await db.select().from(interviews).where(eq(interviews.id, interviewId)).limit(1);
-    if (rows.length === 0) throw new NotFoundException(`Interview ${interviewId} not found`);
-    const row = rows[0];
-
-    const msgRows = await db
-      .select()
-      .from(messages)
-      .where(eq(messages.interviewId, interviewId))
-      .orderBy(asc(messages.createdAt));
-
-    const lastInterviewerMsg = [...msgRows].reverse().find((m) => m.role === 'interviewer');
-
-    return Interview.fromJSON({
-      id: row.id,
-      userId: row.userId,
-      candidateId: (row as Record<string, unknown>).candidateName ?? row.userId,
-      role: row.role,
-      language: row.language,
-      experienceLevel: row.experienceLevel,
-      status: row.status,
-      sessionVariant: row.sessionVariant,
-      maxQuestions: (row as Record<string, unknown>).maxQuestions ?? 10,
-      messages: msgRows.map((m) => ({
-        role: m.role as 'interviewer' | 'candidate',
-        content: m.content,
-        timestamp: m.createdAt,
-      })),
-      currentQuestion: lastInterviewerMsg?.content ?? null,
-      visionMetrics: [],
-      feedback: null,
-      createdAt: row.createdAt,
-      updatedAt: row.createdAt,
-    });
   }
 }

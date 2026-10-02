@@ -9,7 +9,14 @@ interface OllamaMessage {
 }
 
 interface OllamaChatResponse {
-  message: { content: string };
+  message?: { content?: string };
+  error?: string;
+}
+
+interface ChatOptions {
+  /** Ollama structured output — constrains the model to emit valid JSON. */
+  format?: 'json';
+  temperature?: number;
 }
 
 // ─── System Prompts ─────────────────────────────────────────────────────────
@@ -348,8 +355,15 @@ export class AIService implements IAIService {
           : `\nTópicos já abordados em sessões anteriores (evite repetir): ${input.previousTopics.join(', ')}.`)
       : '';
 
-    const questionIndex = Math.floor(input.conversationHistory.length / 2);
-    const progressionHint = progressionTrack[Math.min(questionIndex, progressionTrack.length - 1)];
+    // 0-based index of the question being generated = answers given so far.
+    // (Counting history pairs is wrong: each answer adds an evaluation AND a question.)
+    const questionIndex = input.conversationHistory.filter((m) => m.role === 'user').length;
+    const maxQuestions = input.maxQuestions && input.maxQuestions > 0 ? input.maxQuestions : 10;
+    // The progression tables are written for 10 steps — stretch/compress them to the session length
+    const progressionPos = progressionTrack.length === maxQuestions
+      ? questionIndex
+      : Math.floor((questionIndex * progressionTrack.length) / maxQuestions);
+    const progressionHint = progressionTrack[Math.min(progressionPos, progressionTrack.length - 1)];
 
     let userPrompt: string;
 
@@ -369,13 +383,13 @@ ${visionContext}${cvContext}${topicsContext}`;
       }
     } else {
       if (lang === 'en') {
-        userPrompt = `Candidate: ${candidateName} | Role: ${role} | Level: ${level} | Question ${questionIndex + 1}/10 | Focus: ${progressionHint}.
+        userPrompt = `Candidate: ${candidateName} | Role: ${role} | Level: ${level} | Question ${questionIndex + 1}/${maxQuestions} | Focus: ${progressionHint}.
 Ask the next question — more challenging than the previous one, on a DIFFERENT topic or angle from what was already covered.
 ${variantFocus}
 ${visionContext}${cvContext}${topicsContext}
 Reply with ONLY the question, no introductions.`;
       } else {
-        userPrompt = `Candidato: ${candidateName} | Vaga: ${role} | Nível: ${level} | Pergunta ${questionIndex + 1}/10 | Foco: ${progressionHint}.
+        userPrompt = `Candidato: ${candidateName} | Vaga: ${role} | Nível: ${level} | Pergunta ${questionIndex + 1}/${maxQuestions} | Foco: ${progressionHint}.
 Faça a próxima pergunta — mais desafiadora que a anterior, sobre um TEMA ou ÂNGULO DIFERENTE do que já foi abordado.
 ${variantFocus}
 ${visionContext}${cvContext}${topicsContext}
@@ -509,19 +523,102 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
       { role: 'user', content: prompt },
     ];
 
-    const text = await this.chat(messages);
+    // format: 'json' makes Ollama constrain decoding to valid JSON; the
+    // normaliser still tolerates stray text and loosely-typed fields.
+    // Transport errors propagate so the caller can report failure and retry.
+    const text = await this.chat(messages, { format: 'json', temperature: 0.4 });
 
     try {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('No JSON found in response');
-      return JSON.parse(jsonMatch[0]) as InterviewFeedback;
+      return this.normalizeFeedback(this.extractJson(text), lang);
     } catch (err) {
-      this.logger.error('Failed to parse feedback JSON', err);
+      this.logger.error(`Failed to parse feedback JSON: ${(err as Error).message}`);
       return this.defaultFeedback(lang);
     }
   }
 
-  private async chat(messages: OllamaMessage[]): Promise<string> {
+  // ── Feedback normalisation ────────────────────────────────────────────────
+
+  private extractJson(text: string): Record<string, unknown> {
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('No JSON found in response');
+      return JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+    }
+  }
+
+  /** Accepts 8, "8", "8/10", "8.5 / 10", "80%" — returns a 0-10 score or null. */
+  private parseScore(value: unknown): number | null {
+    let n: number;
+    if (typeof value === 'number') {
+      n = value;
+    } else if (typeof value === 'string') {
+      const fraction = value.match(/(-?\d+(?:[.,]\d+)?)\s*\/\s*(\d+(?:[.,]\d+)?)/);
+      const percent = value.match(/(-?\d+(?:[.,]\d+)?)\s*%/);
+      const plain = value.match(/-?\d+(?:[.,]\d+)?/);
+      if (fraction) {
+        const den = parseFloat(fraction[2].replace(',', '.'));
+        n = den > 0 ? (parseFloat(fraction[1].replace(',', '.')) / den) * 10 : NaN;
+      } else if (percent) {
+        n = parseFloat(percent[1].replace(',', '.')) / 10;
+      } else if (plain) {
+        n = parseFloat(plain[0].replace(',', '.'));
+      } else {
+        return null;
+      }
+    } else {
+      return null;
+    }
+    if (!Number.isFinite(n)) return null;
+    return Math.round(Math.min(10, Math.max(0, n)) * 10) / 10;
+  }
+
+  private parseStringList(value: unknown): string[] {
+    let items: unknown[];
+    if (Array.isArray(value)) {
+      items = value;
+    } else if (typeof value === 'string') {
+      // "a; b" / "- a\n- b" / "1. a\n2. b"
+      items = value.split(/\n|;|•/).map((v) => v.replace(/^\s*(?:[-*]|\d+[.)])\s*/, ''));
+    } else {
+      return [];
+    }
+    return items
+      .map((v) => (typeof v === 'string' ? v : typeof v === 'number' ? String(v) : ''))
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0)
+      .slice(0, 10);
+  }
+
+  private normalizeFeedback(raw: Record<string, unknown>, lang: Language): InterviewFeedback {
+    const fallback = this.defaultFeedback(lang);
+    const technical = this.parseScore(raw.technical);
+    const communication = this.parseScore(raw.communication);
+    const confidence = this.parseScore(raw.confidence);
+    const clarity = this.parseScore(raw.clarity);
+
+    const known = [technical, communication, confidence, clarity].filter((v): v is number => v !== null);
+    const overall = this.parseScore(raw.overall)
+      ?? (known.length > 0 ? Math.round((known.reduce((a, b) => a + b, 0) / known.length) * 10) / 10 : null);
+
+    const summary = typeof raw.summary === 'string' && raw.summary.trim().length > 0
+      ? raw.summary.trim()
+      : fallback.summary;
+
+    return {
+      technical: technical ?? fallback.technical,
+      communication: communication ?? fallback.communication,
+      confidence: confidence ?? fallback.confidence,
+      clarity: clarity ?? fallback.clarity,
+      overall: overall ?? fallback.overall,
+      summary,
+      strengths: this.parseStringList(raw.strengths),
+      improvements: this.parseStringList(raw.improvements),
+    };
+  }
+
+  private async chat(messages: OllamaMessage[], opts: ChatOptions = {}): Promise<string> {
     const url = `${this.ollamaUrl}/api/chat`;
     this.logger.log(`[AI] POST ${url} — model: ${this.model}, messages: ${messages.length}`);
 
@@ -534,7 +631,8 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
           model: this.model,
           messages,
           stream: false,
-          options: { temperature: 0.8 },
+          ...(opts.format ? { format: opts.format } : {}),
+          options: { temperature: opts.temperature ?? 0.8 },
         }),
         signal: AbortSignal.timeout(120_000),
       });
@@ -552,7 +650,14 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
     }
 
     const data = (await res.json()) as OllamaChatResponse;
-    return data.message.content.trim();
+    if (data.error) {
+      throw new Error(`Ollama error: ${data.error}`);
+    }
+    const content = data.message?.content?.trim();
+    if (!content) {
+      throw new Error('Ollama returned an empty response');
+    }
+    return content;
   }
 
   private buildVisionContext(metrics: VisionMetrics | null | undefined, lang: Language = 'pt'): string {

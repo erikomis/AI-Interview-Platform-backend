@@ -7,6 +7,11 @@ import { DrizzleService } from '../../../infrastructure/database/drizzle.service
 import { interviews } from '../../../infrastructure/database/schema';
 import { eq, desc } from 'drizzle-orm';
 import { StartInterviewDto } from './start-interview.dto';
+import {
+  INTERVIEW_CACHE_TTL,
+  interviewCacheKey,
+  persistInterviewMessages,
+} from '../../services/interview-store';
 
 export interface StartInterviewResult {
   interview: Interview;
@@ -62,15 +67,14 @@ export class StartInterviewUseCase {
       sessionVariant: interview.sessionVariant,
       cvContext: dto.cvSummary,
       previousTopics,
+      maxQuestions: interview.maxQuestions,
     });
 
     interview.setCurrentQuestion(firstQuestion);
     interview.addMessage('interviewer', firstQuestion);
 
-    // Save to Redis for fast access during interview
-    await this.redisService.set(`interview:${interview.id}`, JSON.stringify(interview), 3600);
-
-    // Register interview row in PostgreSQL (without messages yet — saved on completion)
+    // Register interview row in PostgreSQL, then persist the first question so the
+    // session can be fully reconstructed from the DB if the Redis key expires.
     await this.drizzleService.db.insert(interviews).values({
       id: interview.id,
       userId,
@@ -82,6 +86,12 @@ export class StartInterviewUseCase {
       maxQuestions: interview.maxQuestions,
       candidateName: dto.candidateId,
     });
+    await persistInterviewMessages(this.drizzleService, interview.id, [
+      { role: 'interviewer', content: firstQuestion },
+    ]);
+
+    // Save to Redis for fast access during interview
+    await this.redisService.set(interviewCacheKey(interview.id), JSON.stringify(interview), INTERVIEW_CACHE_TTL);
 
     let audioBase64: string | null = null;
     try {

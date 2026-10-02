@@ -3,6 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { Readable } from 'stream';
 import { ITTSService } from '../../domain/interfaces/tts.interface';
 
+const EDGE_TTS_TIMEOUT_MS = 20_000;
+
 @Injectable()
 export class TTSService implements ITTSService {
   private readonly logger = new Logger(TTSService.name);
@@ -37,14 +39,31 @@ export class TTSService implements ITTSService {
     const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
     const voice = language === 'en' ? 'en-US-JennyNeural' : 'pt-BR-FranciscaNeural';
     const tts = new MsEdgeTTS();
-    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    const { audioStream }: { audioStream: Readable } = tts.toStream(text);
-    return new Promise((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      audioStream.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
-      audioStream.on('end', () => resolve(Buffer.concat(chunks)));
-      audioStream.on('error', (err: Error) => reject(err));
+
+    const synth = (async (): Promise<Buffer> => {
+      await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+      const { audioStream }: { audioStream: Readable } = tts.toStream(text);
+      return new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        audioStream.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+        audioStream.on('end', () => resolve(Buffer.concat(chunks)));
+        audioStream.on('error', (err: Error) => reject(err));
+      });
+    })();
+
+    // The Edge websocket can stall indefinitely — never let it block an answer
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Edge TTS timed out after ${EDGE_TTS_TIMEOUT_MS}ms`)), EDGE_TTS_TIMEOUT_MS);
     });
+
+    try {
+      return await Promise.race([synth, timeout]);
+    } finally {
+      clearTimeout(timer);
+      synth.catch(() => {/* already timed out — swallow late rejection */});
+      try { tts.close?.(); } catch { /* ignore */ }
+    }
   }
 
   private async synthesizeCoqui(text: string, baseUrl: string): Promise<Buffer> {
@@ -52,7 +71,7 @@ export class TTSService implements ITTSService {
     url.searchParams.set('text', text);
 
     const res = await fetch(url.toString(), {
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!res.ok) {

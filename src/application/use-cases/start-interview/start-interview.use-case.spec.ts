@@ -177,4 +177,22 @@ describe('StartInterviewUseCase', () => {
       }),
     );
   });
+
+  it('persists the first question as a message row so the session can be rebuilt from the DB', async () => {
+    const result = await sut.execute(baseDto);
+
+    expect(drizzleService._insertChain.values).toHaveBeenCalledWith([
+      expect.objectContaining({
+        interviewId: result.interview.id,
+        role: 'interviewer',
+        content: 'Tell me about yourself',
+      }),
+    ]);
+  });
+
+  it('passes maxQuestions to the AI for progression mapping', async () => {
+    await sut.execute({ ...baseDto, sessionMode: 'practice' });
+
+    expect(aiService.generateQuestion).toHaveBeenCalledWith(expect.objectContaining({ maxQuestions: 5 }));
+  });
 });

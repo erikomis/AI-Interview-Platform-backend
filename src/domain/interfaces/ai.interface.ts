@@ -10,6 +10,8 @@ export interface GenerateQuestionInput {
   sessionVariant?: number;
   cvContext?: string;
   previousTopics?: string[];
+  /** Total questions in this session — drives the "Question i/N" hint and progression mapping. */
+  maxQuestions?: number;
 }
 
 export interface EvaluateAnswerInput {

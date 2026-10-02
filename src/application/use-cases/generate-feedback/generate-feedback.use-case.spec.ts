@@ -1,4 +1,4 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { GenerateFeedbackUseCase } from './generate-feedback.use-case';
 import { Interview, InterviewFeedback } from '../../../domain/entities/interview.entity';
 
@@ -43,6 +43,7 @@ const makeAiService = () => ({
 });
 
 const makeRedisService = (raw: string | null = null) => ({
+  setNx: jest.fn().mockResolvedValue(true),
   set: jest.fn().mockResolvedValue(undefined),
   get: jest.fn().mockResolvedValue(raw),
   del: jest.fn().mockResolvedValue(undefined),
@@ -53,32 +54,55 @@ const makeMailService = () => ({
   sendInterviewFeedback: jest.fn().mockResolvedValue(undefined),
 });
 
+const makeVisionService = () => ({
+  processFrame: jest.fn(),
+  endSession: jest.fn().mockResolvedValue(undefined),
+});
+
 interface FakeTx {
   update: jest.Mock;
   insert: jest.Mock;
 }
 
-const makeTxChain = (): FakeTx => ({
-  update: jest.fn().mockReturnValue({
-    set: jest.fn().mockReturnValue({ where: jest.fn().mockResolvedValue([]) }),
-  }),
-  insert: jest.fn().mockReturnValue({
-    values: jest.fn().mockReturnValue({ onConflictDoNothing: jest.fn().mockResolvedValue([]) }),
-  }),
-});
+const makeTxChain = (): FakeTx & { _onConflict: jest.Mock } => {
+  const onConflict = jest.fn().mockResolvedValue([]);
+  return {
+    update: jest.fn().mockReturnValue({
+      set: jest.fn().mockReturnValue({ where: jest.fn().mockResolvedValue([]) }),
+    }),
+    insert: jest.fn().mockReturnValue({
+      values: jest.fn().mockReturnValue({ onConflictDoUpdate: onConflict }),
+    }),
+    _onConflict: onConflict,
+  };
+};
 
+/**
+ * Select calls happen in this order:
+ *  - Redis miss only: interview row, messages
+ *  - always: stored feedback lookup
+ *  - after generation: user row (feedback email)
+ */
 const makeDrizzleService = (
   interviewRow?: Record<string, unknown>,
   msgRows: unknown[] = [],
   userRows: unknown[] = [{ email: 'john@test.com', name: 'John' }],
+  storedFeedbackRows: unknown[] = [],
+  redisMiss = interviewRow !== undefined || msgRows.length > 0,
 ) => {
   const tx = makeTxChain();
+  const select = jest.fn();
+  if (redisMiss) {
+    select
+      .mockReturnValueOnce(dbChain(interviewRow ? [interviewRow] : []))
+      .mockReturnValueOnce(dbChain(msgRows));
+  }
+  select
+    .mockReturnValueOnce(dbChain(storedFeedbackRows))
+    .mockReturnValueOnce(dbChain(userRows)); // for sendFeedbackEmail
   return {
     db: {
-      select: jest.fn()
-        .mockReturnValueOnce(dbChain(interviewRow ? [interviewRow] : []))
-        .mockReturnValueOnce(dbChain(msgRows))
-        .mockReturnValueOnce(dbChain(userRows)), // for sendFeedbackEmail
+      select,
       insert: jest.fn().mockReturnValue({ values: jest.fn().mockResolvedValue([]) }),
       transaction: jest.fn().mockImplementation(
         async (fn: (tx: FakeTx) => Promise<void>) => fn(tx),
@@ -96,12 +120,14 @@ describe('GenerateFeedbackUseCase', () => {
 
   let aiService: ReturnType<typeof makeAiService>;
   let mailService: ReturnType<typeof makeMailService>;
+  let visionService: ReturnType<typeof makeVisionService>;
 
   const makeRedisHit = () => makeRedisService(makeInterviewJson(USER_ID));
 
   beforeEach(() => {
     aiService = makeAiService();
     mailService = makeMailService();
+    visionService = makeVisionService();
   });
 
   const makeSut = (
@@ -113,6 +139,7 @@ describe('GenerateFeedbackUseCase', () => {
       redis as any,
       drizzle as any,
       mailService as any,
+      visionService as any,
     );
 
   // ── Happy path ───────────────────────────────────────────────────────────────
@@ -204,7 +231,7 @@ describe('GenerateFeedbackUseCase', () => {
 
   it('throws NotFoundException when interview not found in Redis or DB', async () => {
     const redis = makeRedisService(null);
-    const drizzle = makeDrizzleService(undefined, []);
+    const drizzle = makeDrizzleService(undefined, [], undefined, [], true);
     const sut = makeSut(redis, drizzle);
 
     await expect(
@@ -222,5 +249,82 @@ describe('GenerateFeedbackUseCase', () => {
     await expect(
       sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID }),
     ).resolves.toBeDefined();
+  });
+
+  // ── Idempotency / guards ─────────────────────────────────────────────────────
+
+  it('returns stored feedback without calling the AI when already generated', async () => {
+    const stored = { ...makeFeedback(), id: 'fb-1', interviewId: INTERVIEW_ID, createdAt: new Date(), overall: 6.5 };
+    const drizzle = makeDrizzleService(undefined, [], undefined, [stored], false);
+    const redis = makeRedisHit();
+    const sut = makeSut(redis, drizzle);
+
+    const result = await sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID });
+
+    expect(result.overall).toBe(6.5);
+    expect(result).not.toHaveProperty('id');
+    expect(aiService.generateFeedback).not.toHaveBeenCalled();
+    expect(drizzle.db.transaction).not.toHaveBeenCalled();
+    expect(redis.setNx).not.toHaveBeenCalled();
+  });
+
+  it('upserts feedback with onConflictDoUpdate', async () => {
+    const drizzle = makeDrizzleService();
+    const sut = makeSut(makeRedisHit(), drizzle);
+    await sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID });
+
+    expect(drizzle._tx._onConflict).toHaveBeenCalledWith(
+      expect.objectContaining({ set: expect.objectContaining({ overall: 8 }) }),
+    );
+  });
+
+  it('does not bulk-insert messages on completion (they are persisted incrementally)', async () => {
+    const drizzle = makeDrizzleService();
+    const sut = makeSut(makeRedisHit(), drizzle);
+    await sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID });
+
+    // The only insert inside the transaction is the feedback upsert
+    expect(drizzle._tx.insert).toHaveBeenCalledTimes(1);
+    expect(drizzle.db.insert).not.toHaveBeenCalled();
+  });
+
+  it('throws BadRequestException when the interview is not in progress and has no feedback', async () => {
+    const interview = new Interview('John', 'Engineer', 'en', 'mid', USER_ID, 10); // PENDING
+    const sut = makeSut(makeRedisService(JSON.stringify(interview)));
+
+    await expect(
+      sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID }),
+    ).rejects.toThrow(BadRequestException);
+    expect(aiService.generateFeedback).not.toHaveBeenCalled();
+  });
+
+  it('throws ConflictException while the interview lock is held', async () => {
+    const redis = makeRedisHit();
+    redis.setNx.mockResolvedValue(false);
+    const sut = makeSut(redis);
+
+    await expect(
+      sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID }),
+    ).rejects.toThrow(ConflictException);
+    expect(aiService.generateFeedback).not.toHaveBeenCalled();
+  });
+
+  it('releases the lock and stores nothing when the AI call fails', async () => {
+    aiService.generateFeedback.mockRejectedValue(new Error('Ollama down'));
+    const redis = makeRedisHit();
+    const drizzle = makeDrizzleService();
+    const sut = makeSut(redis, drizzle);
+
+    await expect(sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID })).rejects.toThrow('Ollama down');
+    expect(drizzle.db.transaction).not.toHaveBeenCalled();
+    expect(redis.del).toHaveBeenCalledWith(expect.stringMatching(/^lock:interview:/));
+  });
+
+  it('ends the vision session after completion (best-effort)', async () => {
+    visionService.endSession.mockRejectedValue(new Error('vision down'));
+    const sut = makeSut(makeRedisHit());
+
+    await expect(sut.execute({ interviewId: INTERVIEW_ID, userId: USER_ID })).resolves.toBeDefined();
+    expect(visionService.endSession).toHaveBeenCalled();
   });
 });

@@ -154,6 +154,33 @@ describe('Interview Entity', () => {
       expect(avg.stress_level).toBeCloseTo(0.3);
       expect(avg.confidence).toBeCloseTo(0.8);
     });
+
+    it('ignores frames where face_visible is false', () => {
+      const interview = makeSut();
+      interview.addVisionMetrics({ eye_contact: 0.8, stress_level: 0.2, confidence: 0.9, face_visible: true });
+      interview.addVisionMetrics({ eye_contact: 0, stress_level: 1, confidence: 0, face_visible: false });
+
+      const avg = interview.getAverageVisionMetrics()!;
+      expect(avg.eye_contact).toBeCloseTo(0.8);
+      expect(avg.stress_level).toBeCloseTo(0.2);
+    });
+
+    it('returns null when every frame lacks a visible face', () => {
+      const interview = makeSut();
+      interview.addVisionMetrics({ eye_contact: 0, stress_level: 0, confidence: 0, face_visible: false });
+      expect(interview.getAverageVisionMetrics()).toBeNull();
+    });
+
+    it('skips non-finite values instead of producing NaN', () => {
+      const interview = makeSut();
+      interview.addVisionMetrics({ eye_contact: 0.6, stress_level: 0.2, confidence: 0.5 });
+      interview.addVisionMetrics({ eye_contact: NaN, stress_level: 0.4, confidence: 0.7 });
+
+      const avg = interview.getAverageVisionMetrics()!;
+      expect(avg.eye_contact).toBeCloseTo(0.6);
+      expect(avg.stress_level).toBeCloseTo(0.3);
+      expect(Number.isNaN(avg.confidence)).toBe(false);
+    });
   });
 
   // ── setCurrentQuestion() ─────────────────────────────────────────────────────
