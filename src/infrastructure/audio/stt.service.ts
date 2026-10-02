@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ISTTService } from '../../domain/interfaces/stt.interface';
+import { ISTTService, TranscriptionFailedError } from '../../domain/interfaces/stt.interface';
 
 @Injectable()
 export class STTService implements ISTTService {
@@ -41,7 +41,7 @@ export class STTService implements ISTTService {
       return transcript;
     } catch (err) {
       this.logger.error('STT transcription failed', err);
-      throw new Error('Failed to transcribe audio');
+      throw new TranscriptionFailedError();
     }
   }
 }
