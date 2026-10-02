@@ -270,6 +270,30 @@ describe('InterviewGateway', () => {
     });
   });
 
+  describe('transcribe_audio', () => {
+    it('returns the transcript to the caller only, without answering', async () => {
+      const d = makeDeps();
+      const client = makeClient();
+      await makeSut(d).handleTranscribeAudio({ interviewId: INTERVIEW_ID, audioBase64: 'AAAA', mimeType: 'audio/webm' }, client as any);
+
+      expect(d.answer.loadAnswerableInterview).toHaveBeenCalledWith(INTERVIEW_ID, USER_ID);
+      expect(d.stt.transcribe).toHaveBeenCalledWith(expect.any(Buffer), 'audio/webm', 'en', expect.any(String));
+      expect(emitted(client, 'transcription')).toEqual([{ interviewId: INTERVIEW_ID, text: 'my spoken answer' }]);
+      expect(d.answer.execute).not.toHaveBeenCalled();
+      expect(roomEmitted('transcript')).toEqual([]);
+    });
+
+    it('reports EMPTY_TRANSCRIPT when nothing intelligible was said', async () => {
+      const d = makeDeps();
+      d.stt.transcribe.mockResolvedValue('');
+      const client = makeClient();
+      await makeSut(d).handleTranscribeAudio({ interviewId: INTERVIEW_ID, audioBase64: 'AAAA' }, client as any);
+
+      expect(emitted(client, 'transcription')).toEqual([]);
+      expect(emitted(client, 'error')).toEqual([{ message: expect.any(String), code: 'EMPTY_TRANSCRIPT' }]);
+    });
+  });
+
   describe('audio_answer', () => {
     it('checks ownership before STT and transcribes in the interview language', async () => {
       const d = makeDeps();
@@ -277,7 +301,7 @@ describe('InterviewGateway', () => {
       await makeSut(d).handleAudioAnswer({ interviewId: INTERVIEW_ID, audioBase64: 'AAAA' }, client as any);
 
       expect(d.answer.loadAnswerableInterview).toHaveBeenCalledWith(INTERVIEW_ID, USER_ID);
-      expect(d.stt.transcribe).toHaveBeenCalledWith(expect.any(Buffer), undefined, 'en');
+      expect(d.stt.transcribe).toHaveBeenCalledWith(expect.any(Buffer), undefined, 'en', expect.stringContaining('Technical job interview'));
       expect(client.join).toHaveBeenCalledWith(`interview:${INTERVIEW_ID}`);
       expect(roomEmitted('transcript')).toEqual([{ interviewId: INTERVIEW_ID, text: 'my spoken answer' }]);
     });

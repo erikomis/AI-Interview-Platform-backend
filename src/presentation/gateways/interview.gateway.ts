@@ -22,8 +22,10 @@ import {
   WsStartInterviewDto,
   WsUserAnswerDto,
   WsAudioAnswerDto,
+  WsTranscribeAudioDto,
   WsVisionMetricsDto,
 } from '../../application/dtos/interview.dto';
+import { buildSttPrompt } from '../../application/services/stt-prompt';
 import { WsValidationPipe } from '../pipes/ws-validation.pipe';
 import { WsErrorFilter } from '../filters/ws-exception.filter';
 import { toWsError, wsError } from '../filters/ws-error';
@@ -35,12 +37,13 @@ import { toWsError, wsError } from '../filters/ws-error';
 //         `auth_expired` (socket stays open) and the client refreshes + reconnects.
 // In:     start_interview { candidateId, role, language?, experienceLevel?,
 //                           sessionMode?, cvSummary?, interviewer?: 'male'|'female' }
-//         user_answer, audio_answer, vision_metrics
+//         user_answer, audio_answer, transcribe_audio, vision_metrics
 // Out:    ai_question, ai_response, transcript, final_feedback, feedback_failed
 //           → emitted to the room `interview:<id>`; every event that proves
 //             ownership (re)joins it, so a reconnected socket still gets
 //             results of a turn that was in flight when the old one dropped.
-//         vision_result, session_info, auth_expired, error { message, code }
+//         transcription (to the caller only), vision_result, session_info,
+//         auth_expired, error { message, code }
 
 // Read lazily so values loaded from .env by ConfigModule are honoured
 // (decorator arguments are evaluated at import time, before ConfigModule runs).
@@ -51,6 +54,7 @@ const allowedOrigins = () =>
 const RATE_LIMITS = {
   start:  { capacity: 1, refillPerSec: 0.5 }, // 1 every 2s
   answer: { capacity: 1, refillPerSec: 0.5 }, // shared by user_answer + audio_answer
+  transcribe: { capacity: 2, refillPerSec: 0.5 }, // review-before-send recordings
   vision: { capacity: 2, refillPerSec: 2 },   // 2 frames per second
 } as const;
 type RateBucket = keyof typeof RATE_LIMITS;
@@ -336,6 +340,43 @@ export class InterviewGateway
   }
 
   // ── audio_answer ────────────────────────────────────────────────────────────
+  /**
+   * Transcribes a recording WITHOUT answering: the client shows the text so the
+   * candidate can fix misrecognised words before sending it as `user_answer`.
+   */
+  @SubscribeMessage('transcribe_audio')
+  async handleTranscribeAudio(
+    @MessageBody() data: WsTranscribeAudioDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    const userId = this.requireSession(client);
+    if (!userId) return;
+    if (!this.consume(client, 'transcribe')) return this.rateLimited(client);
+
+    try {
+      const interview = await this.processAnswerUseCase.loadAnswerableInterview(data.interviewId, userId);
+      this.markOwned(client, interview.id);
+
+      const audioBuffer = Buffer.from(data.audioBase64, 'base64');
+      const text = (
+        await this.sttService.transcribe(audioBuffer, data.mimeType, interview.language, buildSttPrompt(interview))
+      ).trim();
+
+      if (!text) {
+        client.emit('error', wsError(
+          'EMPTY_TRANSCRIPT',
+          interview.language === 'en'
+            ? 'Could not understand the audio — please try again'
+            : 'Não foi possível entender o áudio — tente novamente',
+        ));
+        return;
+      }
+      client.emit('transcription', { interviewId: data.interviewId, text });
+    } catch (err) {
+      this.emitError(client, 'transcribe_audio', err);
+    }
+  }
+
   @SubscribeMessage('audio_answer')
   async handleAudioAnswer(
     @MessageBody() data: WsAudioAnswerDto,
@@ -352,7 +393,9 @@ export class InterviewGateway
       this.markOwned(client, interview.id);
 
       const audioBuffer = Buffer.from(data.audioBase64, 'base64');
-      const transcript = (await this.sttService.transcribe(audioBuffer, data.mimeType, interview.language)).trim();
+      const transcript = (
+        await this.sttService.transcribe(audioBuffer, data.mimeType, interview.language, buildSttPrompt(interview))
+      ).trim();
 
       if (!transcript) {
         client.emit('error', wsError(

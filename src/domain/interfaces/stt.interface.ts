@@ -7,5 +7,9 @@ export class TranscriptionFailedError extends Error {
 }
 
 export interface ISTTService {
-  transcribe(audioBuffer: Buffer, mimeType?: string, language?: string): Promise<string>;
+  /**
+   * @param prompt context that biases recognition (interview role, current
+   *               question, technical vocabulary) — Whisper's `initial_prompt`
+   */
+  transcribe(audioBuffer: Buffer, mimeType?: string, language?: string, prompt?: string): Promise<string>;
 }

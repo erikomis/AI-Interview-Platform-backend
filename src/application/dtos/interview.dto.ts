@@ -154,6 +154,22 @@ export class WsUserAnswerDto {
   visionMetrics?: VisionMetricsDto;
 }
 
+/** Audio to transcribe for review — the candidate edits the text before answering. */
+export class WsTranscribeAudioDto {
+  @IsUUID()
+  interviewId: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(14 * 1024 * 1024)
+  audioBase64: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  mimeType?: string;
+}
+
 export class WsAudioAnswerDto {
   @IsUUID()
   interviewId: string;
