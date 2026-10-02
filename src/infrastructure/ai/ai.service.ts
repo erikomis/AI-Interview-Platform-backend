@@ -1,7 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { IAIService, GenerateQuestionInput, EvaluateAnswerInput, GenerateFeedbackInput } from '../../domain/interfaces/ai.interface';
-import { InterviewFeedback, VisionMetrics, Language } from '../../domain/entities/interview.entity';
+import {
+  IAIService,
+  GenerateQuestionInput,
+  EvaluateAnswerInput,
+  GenerateFeedbackInput,
+  AIUnavailableError,
+} from '../../domain/interfaces/ai.interface';
+import { InterviewFeedback, VisionMetrics, Language, Interviewer } from '../../domain/entities/interview.entity';
+import { toSpeechText } from '../audio/speech-text';
 
 interface OllamaMessage {
   role: 'system' | 'user' | 'assistant';
@@ -17,12 +24,45 @@ interface ChatOptions {
   /** Ollama structured output — constrains the model to emit valid JSON. */
   format?: 'json';
   temperature?: number;
+  /** Max tokens to generate (Ollama `num_predict`) — keeps short replies short. */
+  numPredict?: number;
 }
+
+// ─── Interviewer persona ─────────────────────────────────────────────────────
+
+export const PERSONA_NAMES: Record<Interviewer, string> = { male: 'Alex', female: 'Sofia' };
+
+/** Picks the masculine or feminine Portuguese form for the interviewer persona. */
+const pt = (interviewer: Interviewer, male: string, female: string) => (interviewer === 'female' ? female : male);
 
 // ─── System Prompts ─────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT_PT = `Você é Alex, um entrevistador técnico sênior.
-REGRA ABSOLUTA: NUNCA escreva colchetes [ ] nas suas respostas. NUNCA use placeholders como [Nome], [Cargo], [Empresa]. Use sempre os valores reais fornecidos no prompt.
+const ptIntro = (i: Interviewer) =>
+  `Você é ${PERSONA_NAMES[i]}, ${pt(i, 'um entrevistador técnico sênior', 'uma entrevistadora técnica sênior')} conduzindo uma entrevista por videochamada.`;
+
+const enIntro = (i: Interviewer) =>
+  `You are ${PERSONA_NAMES[i]}, a senior technical interviewer running an interview over a video call.`;
+
+const SPOKEN_RULES_PT = `Tudo o que você escreve será FALADO EM VOZ ALTA por um sintetizador de voz, então escreva como uma pessoa fala numa conversa:
+- Texto corrido em português do Brasil, frases curtas e naturais, tratando o candidato por "você".
+- NUNCA use markdown, asteriscos, títulos, listas, tópicos, emojis, código ou rótulos como "Pergunta:" ou "Avaliação:".`;
+
+const SPOKEN_RULES_EN = `Everything you write will be SPOKEN ALOUD by a text-to-speech voice, so write the way a person talks in conversation:
+- Plain flowing English, short natural sentences, addressing the candidate as "you".
+- NEVER use markdown, asterisks, headings, lists, bullet points, emoji, code, or labels like "Question:" or "Evaluation:".`;
+
+const COMMON_RULES_PT = `- Nunca diga que é uma IA ou um modelo de linguagem, e nunca cite números de métricas comportamentais.
+REGRA ABSOLUTA: NUNCA escreva colchetes [ ] nas suas respostas. NUNCA use placeholders como [Nome], [Cargo], [Empresa]. Use sempre os valores reais fornecidos no prompt.`;
+
+const COMMON_RULES_EN = `- Never say you are an AI or a language model, and never quote behavioral metric numbers.
+ABSOLUTE RULE: NEVER write brackets [ ] in your responses. NEVER use placeholders like [Name], [Role], [Company]. Always use the actual values provided.`;
+
+/** Main interviewer prompt — used to ask questions and to write the final feedback. */
+export function systemPromptPt(i: Interviewer = 'male'): string {
+  return `${ptIntro(i)}
+${SPOKEN_RULES_PT}
+- Faça UMA única pergunta por vez. Nunca junte duas ou três perguntas na mesma fala.
+${COMMON_RULES_PT}
 
 Tipos de perguntas que você DEVE usar (varie entre eles — não repita o mesmo estilo):
 - Situacionais: "Descreva uma situação em que você teve que..."
@@ -32,15 +72,19 @@ Tipos de perguntas que você DEVE usar (varie entre eles — não repita o mesmo
 - System design: "Como você projetaria um sistema que..."
 
 Diretrizes:
-- Seja direto, analítico e exigente — não aceite respostas superficiais sem aprofundar
+- Seja ${pt(i, 'direto, analítico', 'direta, analítica')} e exigente — não aceite respostas superficiais sem aprofundar
 - Faça follow-up se a resposta for vaga: "Pode detalhar mais como funciona X?"
 - IMPORTANTE: Evite repetir temas ou estilos de pergunta já abordados na conversa
 - Aumente progressivamente a dificuldade conforme o candidato responde bem
 - Avalie raciocínio, profundidade técnica, clareza e experiência prática
-- Responda sempre em português`;
+- Responda sempre em português do Brasil`;
+}
 
-const SYSTEM_PROMPT_EN = `You are Alex, a senior technical interviewer.
-ABSOLUTE RULE: NEVER write brackets [ ] in your responses. NEVER use placeholders like [Name], [Role], [Company]. Always use the actual values provided.
+export function systemPromptEn(i: Interviewer = 'male'): string {
+  return `${enIntro(i)}
+${SPOKEN_RULES_EN}
+- Ask exactly ONE question at a time. Never bundle two or three questions together.
+${COMMON_RULES_EN}
 
 Question types you MUST use (vary between them — do not repeat the same style):
 - Situational: "Describe a situation where you had to..."
@@ -56,259 +100,296 @@ Guidelines:
 - Progressively increase difficulty as the candidate responds well
 - Evaluate reasoning, technical depth, clarity, and practical experience
 - Always respond in English`;
+}
+
+/**
+ * Evaluation prompt: the reply is spoken right before the next question (which
+ * is generated separately), so it must never ask anything itself.
+ */
+export function evaluationSystemPromptPt(i: Interviewer = 'male'): string {
+  return `${ptIntro(i)}
+Neste momento você está APENAS comentando a resposta que o candidato acabou de dar. A próxima pergunta será feita depois, separadamente.
+${SPOKEN_RULES_PT}
+- NUNCA faça perguntas, nem mesmo retóricas. Não use ponto de interrogação.
+- Termine sempre com um ponto final.
+${COMMON_RULES_PT}
+
+Diretrizes:
+- Seja ${pt(i, 'direto, honesto', 'direta, honesta')} e específico sobre o que a resposta trouxe ou deixou de fora
+- Não elogie demais uma resposta fraca
+- Avalie raciocínio, profundidade técnica, clareza e experiência prática
+- Responda sempre em português do Brasil`;
+}
+
+export function evaluationSystemPromptEn(i: Interviewer = 'male'): string {
+  return `${enIntro(i)}
+Right now you are ONLY commenting on the answer the candidate just gave. The next question will be asked afterwards, separately.
+${SPOKEN_RULES_EN}
+- NEVER ask any question, not even a rhetorical one. Do not use a question mark.
+- Always end with a period.
+${COMMON_RULES_EN}
+
+Guidelines:
+- Be direct, honest, and specific about what the answer covered or left out
+- Do not over-praise a weak answer
+- Evaluate reasoning, technical depth, clarity, and practical experience
+- Always respond in English`;
+}
 
 // ─── Question Progressions ───────────────────────────────────────────────────
 // Each level has 3 variant tracks so the same candidate gets different questions
 // across sessions. Variant is randomly assigned at interview creation.
+// Hints are TOPICS, never ready-made questions: the model phrases exactly one
+// question from them (bundled "X? Y?" hints made it ask two or three at once).
 
-// variant 1 → implementação / algoritmos / live coding
+// variant 1 → implementação / algoritmos / resolução verbal de problemas
 // variant 2 → arquitetura / design / decisões
 // variant 3 → performance / banco de dados / escalabilidade
 
-const PROGRESSION_PT: Record<string, Record<number, string[]>> = {
+export const PROGRESSION_PT: Record<string, Record<number, string[]>> = {
   junior: {
     1: [
       'apresentação: background e motivação para entrar na área de tecnologia',
       'fundamentos da linguagem da vaga: tipos, escopos e paradigma (OOP ou funcional)',
-      'estruturas de dados: arrays vs listas encadeadas — diferenças e quando usar cada uma',
-      'algoritmos: complexidade Big-O — peça para analisar a complexidade de algum algoritmo conhecido',
-      'live coding: proponha um desafio algorítmico simples adequado ao nível júnior — o candidato deve explicar a abordagem antes de codificar',
-      'algoritmos de busca e ordenação: explore como o candidato entende busca eficiente em coleções',
-      'qualidade de código: o que torna um código limpo e de fácil manutenção?',
-      'testes: como você aborda testes unitários? Já usou TDD?',
-      'debugging: descreva seu processo ao encontrar um bug difícil de reproduzir',
-      'evolução: qual área técnica você quer aprofundar nos próximos meses e por quê?',
+      'estruturas de dados: arrays vs listas encadeadas, diferenças e quando usar cada uma',
+      'algoritmos: complexidade Big-O, com a análise da complexidade de um algoritmo que o candidato conheça',
+      'resolução verbal: descreva um problema algorítmico simples, de nível júnior, em uma frase e peça a abordagem em voz alta, sem código',
+      'algoritmos de busca e ordenação: como o candidato entende busca eficiente em coleções',
+      'qualidade de código: o que torna um código limpo e de fácil manutenção',
+      'testes: a abordagem do candidato para testes unitários e a experiência com TDD',
+      'debugging: o processo do candidato diante de um bug difícil de reproduzir',
+      'evolução: a área técnica que o candidato quer aprofundar nos próximos meses e o motivo',
     ],
     2: [
-      'apresentação: primeiro projeto ou experiência que te fez querer ser desenvolvedor(a)',
-      'fundamentos: gerenciamento de memória na linguagem da vaga — como funciona e quais os riscos?',
-      'estruturas de dados: hash maps — funcionamento interno e complexidade de operações',
-      'algoritmos: recursão vs iteração — prós, contras e quando escolher cada abordagem',
-      'live coding: proponha um problema de manipulação de dados ou lógica simples — peça raciocínio em voz alta antes do código',
-      'orientação a objetos: os pilares (herança, polimorfismo, encapsulamento) com exemplos práticos',
-      'padrões de projeto: explore se o candidato já usou algum e por que escolheu',
-      'tratamento de erros: como o candidato lida com erros e exceções no código?',
+      'apresentação: o primeiro projeto ou experiência que despertou a vontade de ser desenvolvedor(a)',
+      'fundamentos: gerenciamento de memória na linguagem da vaga, como funciona e quais os riscos',
+      'estruturas de dados: hash maps, funcionamento interno e complexidade das operações',
+      'algoritmos: recursão vs iteração, prós, contras e quando escolher cada abordagem',
+      'resolução verbal: descreva um problema simples de manipulação de dados em uma frase e peça a abordagem em voz alta, sem código',
+      'orientação a objetos: herança, polimorfismo e encapsulamento com exemplos práticos',
+      'padrões de projeto: um padrão que o candidato já usou e o motivo da escolha',
+      'tratamento de erros: como o candidato lida com erros e exceções no código',
       'versionamento: fluxo de trabalho com Git em equipe (branches, PRs, code review)',
-      'aprendizado: como o candidato aprende uma nova tecnologia ou framework?',
+      'aprendizado: como o candidato aprende uma nova tecnologia ou framework',
     ],
     3: [
-      'apresentação: um projeto pessoal do qual o candidato se orgulha — o que faz e como foi construído',
-      'fundamentos: semântica de comparação e igualdade na linguagem da vaga — peça um exemplo real que já causou bug',
-      'estruturas de dados: pilhas e filas — peça um caso de uso real para cada uma',
-      'algoritmos: memoização — o que é e quando aplicar? Peça um exemplo concreto',
-      'live coding: proponha um problema de iteração ou lógica condicional — enfatize o raciocínio passo a passo mais do que a velocidade',
-      'performance básica: como o candidato abordaria a otimização de um trecho de código lento?',
-      'colaboração: descreva uma divergência técnica em equipe e como foi resolvida',
-      'testes: quais tipos de teste existem e o que cada um verifica?',
-      'debugging: qual foi o bug mais difícil já corrigido? Como chegou à causa raiz?',
-      'encerramento: o que o candidato faria diferente em um projeto anterior com o conhecimento de hoje?',
+      'apresentação: um projeto pessoal do qual o candidato se orgulha, o que faz e como foi construído',
+      'fundamentos: semântica de comparação e igualdade na linguagem da vaga, com um exemplo real que já causou bug',
+      'estruturas de dados: pilhas e filas, com um caso de uso real para cada uma',
+      'algoritmos: memoização, o que é e quando aplicar, com um exemplo concreto',
+      'resolução verbal: descreva um problema simples de iteração ou lógica condicional em uma frase e peça a abordagem em voz alta, passo a passo, sem código',
+      'performance básica: como o candidato abordaria a otimização de um trecho de código lento',
+      'colaboração: uma divergência técnica em equipe e como ela foi resolvida',
+      'testes: os tipos de teste que existem e o que cada um verifica',
+      'debugging: o bug mais difícil que o candidato já corrigiu e como chegou à causa raiz',
+      'encerramento: o que o candidato faria diferente em um projeto anterior com o conhecimento de hoje',
     ],
   },
   mid: {
     1: [
-      'apresentação: sua área técnica mais forte e um projeto que a demonstra',
-      'linguagem: generics, closures ou metaprogramação — como e quando você os usa?',
-      'estruturas de dados: árvores e grafos — DFS vs BFS com análise de complexidade',
-      'algoritmos: programação dinâmica — explique com um exemplo concreto que já usou',
-      'live coding: resolva um problema de complexidade média e justifique cada decisão (abordagem, estrutura, complexidade)',
-      'performance de aplicação: como você perfilha e identifica gargalos? Quais ferramentas usa?',
-      'banco de dados: otimização de queries — índices, EXPLAIN/EXPLAIN ANALYZE, problema N+1',
-      'princípios SOLID: dê um exemplo real de como aplicou cada princípio',
-      'testes: testes de integração vs unitários — quando usar cada um e o que cada tipo garante?',
-      'encerramento: qual refatoração ou melhoria técnica você mais se orgulha? O que motivou e qual foi o impacto?',
+      'apresentação: a área técnica mais forte do candidato e um projeto que a demonstra',
+      'linguagem: generics, closures ou metaprogramação, como e quando o candidato os usa',
+      'estruturas de dados: árvores e grafos, DFS vs BFS com análise de complexidade',
+      'algoritmos: programação dinâmica, com um exemplo concreto que o candidato já usou',
+      'resolução verbal: descreva um problema de complexidade média em uma frase e peça a abordagem em voz alta, com estrutura de dados e complexidade, sem código',
+      'performance de aplicação: como o candidato perfila e identifica gargalos, e as ferramentas que usa',
+      'banco de dados: otimização de queries, índices, EXPLAIN ANALYZE e o problema N+1',
+      'princípios SOLID: um exemplo real de aplicação em código de produção',
+      'testes: testes de integração vs unitários, quando usar cada um e o que cada tipo garante',
+      'encerramento: a refatoração ou melhoria técnica de que o candidato mais se orgulha, a motivação e o impacto',
     ],
     2: [
-      'apresentação: um sistema que você projetou ou no qual contribuiu significativamente',
-      'padrões de projeto: factory, observer, strategy — descreva cenários reais de uso',
-      'estruturas de dados: quando você escolheria uma heap ao invés de um array ordenado?',
-      'concorrência: threads, coroutines ou async/await — trade-offs em cada abordagem',
-      'live coding: modele uma hierarquia de classes para um domínio de negócio — justifique as abstrações',
-      'arquitetura: monolito vs microsserviços — o que guiou a última decisão arquitetural em que participou?',
-      'banco de dados: normalização vs desnormalização — quando cada uma faz sentido?',
-      'design de API: REST vs GraphQL — trade-offs de design e manutenção',
-      'cache: estratégias (LRU, write-through, write-back) e quando aplicar cada uma',
-      'encerramento: descreva uma dívida técnica que você endereçou — como identificou, priorizou e executou?',
+      'apresentação: um sistema que o candidato projetou ou no qual contribuiu significativamente',
+      'padrões de projeto: factory, observer e strategy em cenários reais de uso',
+      'estruturas de dados: heap vs array ordenado e quando escolher cada um',
+      'concorrência: threads, coroutines ou async/await e os trade-offs de cada abordagem',
+      'resolução verbal: descreva um domínio de negócio em uma frase e peça em voz alta, sem código, como o candidato modelaria as entidades e abstrações',
+      'arquitetura: monolito vs microsserviços e o que guiou a última decisão arquitetural de que o candidato participou',
+      'banco de dados: normalização vs desnormalização e quando cada uma faz sentido',
+      'design de API: REST vs GraphQL, trade-offs de design e manutenção',
+      'cache: estratégias LRU, write-through e write-back e quando aplicar cada uma',
+      'encerramento: uma dívida técnica que o candidato endereçou, como identificou, priorizou e executou',
     ],
     3: [
-      'apresentação: um desafio de performance que você resolveu — contexto, causa raiz e solução',
-      'linguagem: como funciona o gerenciamento de memória (GC, vazamentos) na sua linguagem principal?',
-      'estruturas de dados: quando usar uma trie vs hash map para busca em texto?',
-      'algoritmos: complexidade amortizada — dê um exemplo real onde isso importa',
-      'live coding: otimize uma função ineficiente — analise o antes e o depois com complexidades',
-      'banco de dados: tipos de índice (B-tree, hash, composto, parcial) — quando usar cada um?',
-      'banco de dados: como você interpreta um EXPLAIN PLAN? Quais os principais sinais de alerta?',
-      'performance: como você identifica gargalos em produção? Quais métricas e ferramentas usa?',
-      'concorrência: race conditions e deadlocks — como prevenir e detectar?',
-      'encerramento: qual foi o maior ganho de performance que você já entregou? Como mediu o resultado?',
+      'apresentação: um desafio de performance que o candidato resolveu, com contexto, causa raiz e solução',
+      'linguagem: gerenciamento de memória, garbage collector e vazamentos na linguagem principal do candidato',
+      'estruturas de dados: trie vs hash map para busca em texto',
+      'algoritmos: complexidade amortizada, com um exemplo real em que ela importa',
+      'resolução verbal: descreva uma função ineficiente em uma frase e peça em voz alta, sem código, como o candidato a otimizaria e a complexidade antes e depois',
+      'banco de dados: tipos de índice (B-tree, hash, composto, parcial) e quando usar cada um',
+      'banco de dados: leitura de um plano de execução (EXPLAIN) e os principais sinais de alerta',
+      'performance: identificação de gargalos em produção, com as métricas e ferramentas usadas',
+      'concorrência: race conditions e deadlocks, prevenção e detecção',
+      'encerramento: o maior ganho de performance que o candidato já entregou e como o resultado foi medido',
     ],
   },
   senior: {
     1: [
-      'apresentação: contribuição técnica de maior impacto na sua carreira — o que construiu e qual o resultado?',
-      'linguagem: internals avançados — event loop, ajuste de GC ou compilação JIT, conforme a stack',
-      'algoritmos: problemas NP-difíceis em produção — como você os aborda na prática?',
-      'live coding: resolva um problema complexo com múltiplas abordagens válidas — compare os trade-offs de cada uma',
-      'banco de dados: indexação avançada — índices parciais, covering indexes, index-only scans',
-      'performance em escala: sharding, read replicas, connection pooling — quando e por quê cada estratégia?',
-      'system design: projete um rate limiter distribuído para 100 mil requisições/segundo',
-      'sistemas distribuídos: teorema CAP — como você toma decisões de consistência em produção?',
-      'confiabilidade: circuit breakers, bulkhead pattern, chaos engineering — como aplica na prática?',
-      'encerramento: como você avalia se um sistema está pronto para 10x de tráfego?',
+      'apresentação: a contribuição técnica de maior impacto na carreira do candidato e o resultado obtido',
+      'linguagem: internals avançados, como event loop, ajuste de GC ou compilação JIT, conforme a stack',
+      'algoritmos: problemas NP-difíceis em produção e como abordá-los na prática',
+      'resolução verbal: descreva em uma frase um problema complexo com várias abordagens válidas e peça em voz alta, sem código, a comparação dos trade-offs',
+      'banco de dados: indexação avançada, índices parciais, covering indexes e index-only scans',
+      'performance em escala: sharding, read replicas e connection pooling, quando e por que usar cada estratégia',
+      'system design: um rate limiter distribuído para 100 mil requisições por segundo',
+      'sistemas distribuídos: teorema CAP e decisões de consistência em produção',
+      'confiabilidade: circuit breakers, bulkhead e chaos engineering aplicados na prática',
+      'encerramento: como avaliar se um sistema está pronto para dez vezes mais tráfego',
     ],
     2: [
-      'apresentação: uma decisão técnica estratégica que você liderou do início ao fim — impacto e aprendizados',
-      'arquitetura: event sourcing vs CQRS — quando e por quê adotar? Quais as armadilhas?',
-      'dados: persistência poliglota — como você escolhe o banco certo para cada workload?',
-      'system design: projete um sistema de notificações que processe 1 milhão de eventos por segundo',
-      'liderança técnica: como você conduz revisões arquiteturais e garante padrões de engenharia no time?',
-      'sistemas distribuídos: consistência eventual — como você raciocina e testa comportamentos assíncronos?',
+      'apresentação: uma decisão técnica estratégica que o candidato liderou do início ao fim, impacto e aprendizados',
+      'arquitetura: event sourcing e CQRS, quando adotar e quais as armadilhas',
+      'dados: persistência poliglota e a escolha do banco certo para cada workload',
+      'system design: um sistema de notificações que processe 1 milhão de eventos por segundo',
+      'liderança técnica: condução de revisões arquiteturais e garantia de padrões de engenharia no time',
+      'sistemas distribuídos: consistência eventual e como raciocinar sobre e testar comportamentos assíncronos',
       'performance: identificação e resolução de falhas em cascata em microsserviços',
-      'observabilidade: o que compõe um stack de observabilidade production-ready? (logs, métricas, traces)',
-      'gestão de time: como você faz mentoria e melhora a velocidade do time sem criar dependência?',
-      'encerramento: descreva uma situação em que você discordou de stakeholders em uma decisão técnica — como conduziu?',
+      'observabilidade: um stack de observabilidade pronto para produção, com logs, métricas e traces',
+      'gestão de time: mentoria e aumento da velocidade do time sem criar dependência',
+      'encerramento: uma divergência com stakeholders sobre uma decisão técnica e como ela foi conduzida',
     ],
     3: [
-      'apresentação: um desafio de escalabilidade que você resolveu do zero — arquitetura antes e depois',
-      'banco de dados: write amplification, LSM trees vs B-trees — em que workloads cada um se destaca?',
-      'cache: cache stampede, estratégias de invalidação e configuração de CDN para alta disponibilidade',
-      'performance: regressões de plano de query em produção — como detecta e previne?',
-      'live coding: projete um cache distribuído — identifique e discuta os edge cases',
-      'deploy: zero-downtime deployments — blue/green, canary e feature flags — trade-offs de cada estratégia',
-      'sistemas distribuídos: transações distribuídas — 2PC vs padrão Saga — quando usar cada um?',
-      'segurança: OWASP em escala — injeção, autenticação, gestão de segredos em CI/CD',
-      'incident response: como você conduz um post-mortem eficaz e garante que o problema não se repita?',
-      'encerramento: como você influencia a cultura de engenharia de uma organização a longo prazo?',
+      'apresentação: um desafio de escalabilidade resolvido do zero, com a arquitetura antes e depois',
+      'banco de dados: write amplification, LSM trees vs B-trees e os workloads em que cada um se destaca',
+      'cache: cache stampede, estratégias de invalidação e CDN para alta disponibilidade',
+      'performance: regressões de plano de query em produção, detecção e prevenção',
+      'resolução verbal: descreva em uma frase a necessidade de um cache distribuído e peça em voz alta, sem código, o desenho da solução e os edge cases',
+      'deploy: zero-downtime deployments com blue/green, canary e feature flags, e os trade-offs de cada estratégia',
+      'sistemas distribuídos: transações distribuídas, 2PC vs padrão Saga e quando usar cada um',
+      'segurança: OWASP em escala, injeção, autenticação e gestão de segredos em CI/CD',
+      'incident response: condução de um post-mortem eficaz e prevenção de recorrência',
+      'encerramento: como influenciar a cultura de engenharia de uma organização a longo prazo',
     ],
   },
 };
 
-const PROGRESSION_EN: Record<string, Record<number, string[]>> = {
+export const PROGRESSION_EN: Record<string, Record<number, string[]>> = {
   junior: {
     1: [
       'introduction: background and what motivated the candidate to get into software engineering',
       'language fundamentals: type system, scopes, and the core paradigm (OOP or functional) of their stack',
-      'data structures: arrays vs linked lists — differences and when to use each',
-      'algorithms: Big-O complexity — ask the candidate to analyze the complexity of an algorithm they know',
-      'live coding: propose a simple algorithmic challenge appropriate for junior level — candidate must explain their approach before writing any code',
-      'algorithms: efficient search in collections — explore how the candidate thinks about finding elements',
-      'code quality: what makes code clean and easy to maintain?',
-      'testing: how do they approach unit testing? Have they used TDD?',
-      'debugging: describe the process when dealing with a bug that is hard to reproduce',
-      'growth: what technical area do they want to deepen in the next few months and why?',
+      'data structures: arrays vs linked lists, their differences and when to use each',
+      'algorithms: Big-O complexity, analyzing the complexity of an algorithm the candidate knows',
+      'verbal problem solving: describe a simple junior-level algorithmic problem in one sentence and ask for the approach out loud, no code',
+      'algorithms: efficient search in collections and how the candidate thinks about finding elements',
+      'code quality: what makes code clean and easy to maintain',
+      'testing: the candidate\'s approach to unit testing and any experience with TDD',
+      'debugging: the candidate\'s process when dealing with a bug that is hard to reproduce',
+      'growth: the technical area the candidate wants to deepen in the next few months and why',
     ],
     2: [
-      'introduction: the first project or experience that made them want to be a developer',
-      'language internals: memory management in their primary language — how it works and what can go wrong',
-      'data structures: hash maps — internal mechanics and complexity of operations',
-      'algorithms: recursion vs iteration — pros, cons, and when to choose each',
-      'live coding: propose a data manipulation or logic problem — ask the candidate to reason out loud before coding',
-      'OOP: the three pillars (inheritance, polymorphism, encapsulation) with practical examples',
-      'design patterns: explore whether the candidate has used any and why they chose it',
-      'error handling: how do they handle errors and exceptions in their code?',
+      'introduction: the first project or experience that made the candidate want to be a developer',
+      'language internals: memory management in their primary language, how it works and what can go wrong',
+      'data structures: hash maps, their internal mechanics and the complexity of operations',
+      'algorithms: recursion vs iteration, pros, cons, and when to choose each',
+      'verbal problem solving: describe a simple data manipulation problem in one sentence and ask for the approach out loud, no code',
+      'OOP: inheritance, polymorphism, and encapsulation with practical examples',
+      'design patterns: a pattern the candidate has used and why they chose it',
+      'error handling: how the candidate handles errors and exceptions in their code',
       'version control: Git workflow in a team setting (branches, PRs, code review)',
-      'learning: how do they approach picking up a new technology or framework?',
+      'learning: how the candidate approaches picking up a new technology or framework',
     ],
     3: [
-      'introduction: a personal project they are proud of — what it does and how it was built',
-      'language: equality and comparison semantics in their language — ask for a real example that once caused a bug',
-      'data structures: stacks and queues — ask for a real-world use case for each',
-      'algorithms: memoization — what it is and when to apply it, with a concrete example',
-      'live coding: propose an iteration or conditional logic problem — emphasize step-by-step reasoning over speed',
-      'performance basics: how would they approach optimizing a slow block of code?',
-      'collaboration: describe a technical disagreement in a team and how it was resolved',
-      'testing: what types of tests exist and what does each verify?',
-      'debugging: what is the hardest bug they have ever fixed? How did they find the root cause?',
-      'closing: what would they do differently in a past project with their current knowledge?',
+      'introduction: a personal project the candidate is proud of, what it does and how it was built',
+      'language: equality and comparison semantics in their language, with a real example that once caused a bug',
+      'data structures: stacks and queues, with a real-world use case for each',
+      'algorithms: memoization, what it is and when to apply it, with a concrete example',
+      'verbal problem solving: describe a simple iteration or conditional logic problem in one sentence and ask for the approach out loud, step by step, no code',
+      'performance basics: how the candidate would approach optimizing a slow block of code',
+      'collaboration: a technical disagreement in a team and how it was resolved',
+      'testing: the types of tests that exist and what each one verifies',
+      'debugging: the hardest bug the candidate has fixed and how they found the root cause',
+      'closing: what the candidate would do differently in a past project with their current knowledge',
     ],
   },
   mid: {
     1: [
-      'introduction: your strongest technical area and a project that demonstrates it',
-      'language deep-dive: generics, closures, or metaprogramming — how and when do you use them?',
-      'data structures: trees and graphs — DFS vs BFS with complexity analysis',
-      'algorithms: dynamic programming — explain with a concrete example you have actually used',
-      'live coding: solve a medium-complexity problem and justify each decision (approach, data structure, complexity)',
-      'application performance: how do you profile and identify bottlenecks? What tools do you use?',
-      'database: query optimization — indexes, EXPLAIN/EXPLAIN ANALYZE, and the N+1 problem',
-      'SOLID principles: give a real example of applying each principle in production code',
-      'testing: integration tests vs unit tests — when to use each and what each type guarantees',
-      'closing: what refactoring or technical improvement are you most proud of? What drove it and what was the impact?',
+      'introduction: the candidate\'s strongest technical area and a project that demonstrates it',
+      'language deep-dive: generics, closures, or metaprogramming, and how and when the candidate uses them',
+      'data structures: trees and graphs, DFS vs BFS with complexity analysis',
+      'algorithms: dynamic programming, with a concrete example the candidate has actually used',
+      'verbal problem solving: describe a medium-complexity problem in one sentence and ask for the approach out loud, including data structure and complexity, no code',
+      'application performance: how the candidate profiles and identifies bottlenecks, and the tools they use',
+      'database: query optimization, indexes, EXPLAIN ANALYZE, and the N+1 problem',
+      'SOLID principles: a real example of applying them in production code',
+      'testing: integration tests vs unit tests, when to use each and what each type guarantees',
+      'closing: the refactoring or technical improvement the candidate is most proud of, what drove it and its impact',
     ],
     2: [
-      'introduction: a system you designed or significantly contributed to',
-      'design patterns: factory, observer, strategy — describe real use cases for each',
-      'data structures: when would you choose a heap over a sorted array?',
-      'concurrency: threads, coroutines, or async/await — trade-offs in each approach',
-      'live coding: model a class hierarchy for a business domain — justify your abstractions',
-      'architecture: monolith vs microservices — what drove the last architectural decision you were part of?',
-      'database: normalization vs denormalization — when does each make sense?',
-      'API design: REST vs GraphQL — design and maintenance trade-offs',
-      'caching: strategies (LRU, write-through, write-back) and when to apply each',
-      'closing: describe a technical debt you addressed — how did you identify, prioritize, and execute it?',
+      'introduction: a system the candidate designed or significantly contributed to',
+      'design patterns: factory, observer, and strategy in real use cases',
+      'data structures: a heap vs a sorted array and when to choose each',
+      'concurrency: threads, coroutines, or async/await and the trade-offs of each approach',
+      'verbal problem solving: describe a business domain in one sentence and ask out loud, no code, how the candidate would model its entities and abstractions',
+      'architecture: monolith vs microservices and what drove the last architectural decision the candidate was part of',
+      'database: normalization vs denormalization and when each makes sense',
+      'API design: REST vs GraphQL, design and maintenance trade-offs',
+      'caching: LRU, write-through, and write-back strategies and when to apply each',
+      'closing: a technical debt the candidate addressed, how they identified, prioritized, and executed it',
     ],
     3: [
-      'introduction: a performance challenge you solved — context, root cause, and solution',
-      'language: how does memory management (GC, leaks) work in your primary language?',
-      'data structures: when would you use a trie vs a hash map for text search?',
-      'algorithms: amortized complexity — give a real example where it matters in practice',
-      'live coding: optimize an inefficient function — analyze the before and after with their complexities',
-      'database: index types (B-tree, hash, composite, partial) — when to use each?',
-      'database: how do you interpret an EXPLAIN PLAN? What are the main warning signs?',
-      'performance: how do you identify bottlenecks in production? What metrics and tools do you rely on?',
-      'concurrency: race conditions and deadlocks — how do you prevent and detect them?',
-      'closing: what is the biggest performance gain you have delivered? How did you measure the result?',
+      'introduction: a performance challenge the candidate solved, with context, root cause, and solution',
+      'language: memory management, garbage collection, and leaks in the candidate\'s primary language',
+      'data structures: a trie vs a hash map for text search',
+      'algorithms: amortized complexity, with a real example where it matters in practice',
+      'verbal problem solving: describe an inefficient function in one sentence and ask out loud, no code, how the candidate would optimize it and the complexity before and after',
+      'database: index types (B-tree, hash, composite, partial) and when to use each',
+      'database: reading an execution plan (EXPLAIN) and the main warning signs',
+      'performance: identifying bottlenecks in production, with the metrics and tools the candidate relies on',
+      'concurrency: race conditions and deadlocks, prevention and detection',
+      'closing: the biggest performance gain the candidate has delivered and how the result was measured',
     ],
   },
   senior: {
     1: [
-      'introduction: your highest-impact technical contribution — what you built and what the outcome was',
-      'language internals: event loop tuning, GC configuration, or JIT compilation behavior in your stack',
-      'algorithms: NP-hard problems in production — how do you handle them practically?',
-      'live coding: solve a complex problem with multiple valid approaches — compare the trade-offs of each',
-      'database: advanced indexing — partial indexes, covering indexes, and index-only scans',
-      'performance at scale: sharding, read replicas, and connection pooling — when and why each strategy?',
-      'system design: design a distributed rate limiter handling 100k requests per second',
-      'distributed systems: CAP theorem — how do you make consistency trade-offs in production?',
-      'reliability: circuit breakers, bulkhead pattern, chaos engineering — how do you apply them in practice?',
-      'closing: how do you evaluate whether a system is ready for 10x traffic?',
+      'introduction: the candidate\'s highest-impact technical contribution and its outcome',
+      'language internals: event loop tuning, GC configuration, or JIT compilation behavior in their stack',
+      'algorithms: NP-hard problems in production and how to handle them practically',
+      'verbal problem solving: describe a complex problem with several valid approaches in one sentence and ask out loud, no code, for a comparison of the trade-offs',
+      'database: advanced indexing, partial indexes, covering indexes, and index-only scans',
+      'performance at scale: sharding, read replicas, and connection pooling, and when and why to use each strategy',
+      'system design: a distributed rate limiter handling 100k requests per second',
+      'distributed systems: the CAP theorem and consistency trade-offs in production',
+      'reliability: circuit breakers, the bulkhead pattern, and chaos engineering in practice',
+      'closing: evaluating whether a system is ready for ten times the traffic',
     ],
     2: [
-      'introduction: a strategic technical decision you owned end-to-end — impact and lessons learned',
-      'architecture: event sourcing vs CQRS — when and why to adopt? What are the pitfalls?',
-      'data: polyglot persistence — how do you choose the right database for each workload?',
-      'system design: design a notification system that processes 1 million events per second',
-      'tech lead: how do you run architectural reviews and enforce engineering standards across the team?',
-      'distributed systems: eventual consistency — how do you reason about and test asynchronous behavior?',
+      'introduction: a strategic technical decision the candidate owned end-to-end, its impact and lessons learned',
+      'architecture: event sourcing and CQRS, when to adopt them and their pitfalls',
+      'data: polyglot persistence and choosing the right database for each workload',
+      'system design: a notification system that processes 1 million events per second',
+      'tech lead: running architectural reviews and enforcing engineering standards across the team',
+      'distributed systems: eventual consistency and how to reason about and test asynchronous behavior',
       'performance: identifying and resolving cascading failures in a microservices architecture',
-      'observability: what does a production-ready observability stack look like? (logs, metrics, traces)',
-      'team impact: how do you mentor engineers and improve team velocity without creating dependency?',
-      'closing: describe a time you pushed back on stakeholders on a technical decision — how did you handle it and what was the outcome?',
+      'observability: a production-ready observability stack with logs, metrics, and traces',
+      'team impact: mentoring engineers and improving team velocity without creating dependency',
+      'closing: a time the candidate pushed back on stakeholders on a technical decision and how it played out',
     ],
     3: [
-      'introduction: a scaling challenge you solved from scratch — the architecture before and after',
-      'database: write amplification, LSM trees vs B-trees — in what workloads does each excel?',
+      'introduction: a scaling challenge the candidate solved from scratch, with the architecture before and after',
+      'database: write amplification, LSM trees vs B-trees, and the workloads where each excels',
       'caching: cache stampede, invalidation strategies, and CDN configuration for high availability',
-      'performance: query plan regressions in production — how do you detect and prevent them?',
-      'live coding: design a distributed cache — identify and discuss the edge cases',
-      'deployment: zero-downtime deployments — blue/green, canary, and feature flags — trade-offs of each',
-      'distributed systems: distributed transactions — 2PC vs the Saga pattern — when to use each?',
-      'security: OWASP at scale — injection, authentication, and secrets management in CI/CD pipelines',
-      'incident response: how do you run an effective post-mortem and ensure the problem does not recur?',
-      'closing: how do you influence engineering culture across an organization over the long term?',
+      'performance: query plan regressions in production, detection and prevention',
+      'verbal problem solving: describe the need for a distributed cache in one sentence and ask out loud, no code, for the design and its edge cases',
+      'deployment: zero-downtime deployments with blue/green, canary, and feature flags, and the trade-offs of each',
+      'distributed systems: distributed transactions, 2PC vs the Saga pattern, and when to use each',
+      'security: OWASP at scale, injection, authentication, and secrets management in CI/CD pipelines',
+      'incident response: running an effective post-mortem and preventing the problem from recurring',
+      'closing: influencing engineering culture across an organization over the long term',
     ],
   },
 };
 
-const VARIANT_FOCUS_PT: Record<number, string> = {
-  1: 'Foco em implementação, algoritmos e live coding — peça ao candidato para explicar o raciocínio e justificar escolhas técnicas antes e durante a implementação.',
-  2: 'Foco em arquitetura, padrões de projeto e system design — explore decisões, trade-offs e os "porquês" por trás de cada escolha.',
-  3: 'Foco em performance, otimização de queries, indexação e escalabilidade — investigue como o candidato mede e melhora a performance de sistemas reais.',
+export const VARIANT_FOCUS_PT: Record<number, string> = {
+  1: 'Foco da sessão: implementação, algoritmos e resolução verbal de problemas, com o candidato explicando o raciocínio em voz alta e justificando as escolhas técnicas, sem escrever código.',
+  2: 'Foco da sessão: arquitetura, padrões de projeto e system design, explorando decisões, trade-offs e os motivos por trás de cada escolha.',
+  3: 'Foco da sessão: performance, otimização de queries, indexação e escalabilidade, investigando como o candidato mede e melhora a performance de sistemas reais.',
 };
 
-const VARIANT_FOCUS_EN: Record<number, string> = {
-  1: 'Focus on implementation, algorithms, and live coding — ask the candidate to explain their reasoning and justify technical choices before and during coding.',
-  2: 'Focus on architecture, design patterns, and system design — probe decisions, trade-offs, and the reasoning behind each choice.',
-  3: 'Focus on performance, query optimization, indexing, and scalability — explore how the candidate measures and improves real system performance.',
+export const VARIANT_FOCUS_EN: Record<number, string> = {
+  1: 'Session focus: implementation, algorithms, and verbal problem solving, with the candidate explaining their reasoning out loud and justifying technical choices, without writing code.',
+  2: 'Session focus: architecture, design patterns, and system design, probing decisions, trade-offs, and the reasoning behind each choice.',
+  3: 'Session focus: performance, query optimization, indexing, and scalability, exploring how the candidate measures and improves real system performance.',
 };
 
 // ─── Input Sanitization ──────────────────────────────────────────────────────
@@ -316,6 +397,8 @@ const VARIANT_FOCUS_EN: Record<number, string> = {
 function sanitizeInput(value: string, maxLength = 200): string {
   return value.replace(/[<>"'`\\]/g, '').trim().slice(0, maxLength);
 }
+
+const SCORE_KEYS = ['technical', 'communication', 'confidence', 'clarity', 'overall'] as const;
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 
@@ -327,17 +410,19 @@ export class AIService implements IAIService {
 
   constructor(private readonly configService: ConfigService) {
     this.ollamaUrl = this.configService.get('OLLAMA_URL', 'http://localhost:11434');
-    this.model = this.configService.get('OLLAMA_MODEL', 'llama3.1:8b');
+    this.model = this.configService.get('OLLAMA_MODEL', 'qwen2.5:7b');
   }
 
   async generateQuestion(input: GenerateQuestionInput): Promise<string> {
     const lang = input.language ?? 'pt';
     const level = input.experienceLevel ?? 'mid';
     const variant = input.sessionVariant ?? 1;
+    const interviewer = input.interviewer ?? 'male';
+    const persona = PERSONA_NAMES[interviewer];
     const candidateName = sanitizeInput(input.candidateName);
     const role = sanitizeInput(input.role);
 
-    const systemPrompt = lang === 'en' ? SYSTEM_PROMPT_EN : SYSTEM_PROMPT_PT;
+    const systemPrompt = lang === 'en' ? systemPromptEn(interviewer) : systemPromptPt(interviewer);
     const progressionTrack = (lang === 'en' ? PROGRESSION_EN[level] : PROGRESSION_PT[level])?.[variant]
       ?? (lang === 'en' ? PROGRESSION_EN['mid'][1] : PROGRESSION_PT['mid'][1]);
     const variantFocus = lang === 'en' ? VARIANT_FOCUS_EN[variant] ?? '' : VARIANT_FOCUS_PT[variant] ?? '';
@@ -370,30 +455,36 @@ export class AIService implements IAIService {
     if (input.conversationHistory.length === 0) {
       if (lang === 'en') {
         userPrompt = `The candidate's name is ${candidateName}, applying for ${role} (level: ${level}).
-Greet them using exactly the name "${candidateName}" and ask the first question about: ${progressionHint}.
-Example: "Hello, ${candidateName}! ..."
+Greet them warmly using exactly the name "${candidateName}", introduce yourself in one short sentence, and ask the first question about this topic: ${progressionHint}.
+Keep it under 60 words and end with exactly one question, with a single question mark.
+Example: "Hi ${candidateName}, I'm ${persona} and I'll be running your interview today. ..."
 ${variantFocus}
 ${visionContext}${cvContext}${topicsContext}`;
       } else {
         userPrompt = `O candidato se chama ${candidateName} e está aplicando para ${role} (nível: ${level}).
-Cumprimente-o(a) usando exatamente o nome "${candidateName}" e faça a primeira pergunta sobre: ${progressionHint}.
-Exemplo: "Olá, ${candidateName}! ..."
+Cumprimente-o(a) de forma cordial usando exatamente o nome "${candidateName}", apresente-se em uma frase curta e faça a primeira pergunta sobre este tema: ${progressionHint}.
+Use no máximo 60 palavras e termine com exatamente uma pergunta, com um único ponto de interrogação.
+Exemplo: "Olá, ${candidateName}, eu sou ${pt(interviewer, 'o', 'a')} ${persona} e vou conduzir sua entrevista hoje. ..."
 ${variantFocus}
 ${visionContext}${cvContext}${topicsContext}`;
       }
     } else {
+      // Written as prose on purpose: a "Label: x | Label: y" header gets echoed
+      // back verbatim by small models.
       if (lang === 'en') {
-        userPrompt = `Candidate: ${candidateName} | Role: ${role} | Level: ${level} | Question ${questionIndex + 1}/${maxQuestions} | Focus: ${progressionHint}.
-Ask the next question — more challenging than the previous one, on a DIFFERENT topic or angle from what was already covered.
+        userPrompt = `You are interviewing ${candidateName} for the ${role} position at ${level} level, and this is question ${questionIndex + 1} of ${maxQuestions}.
+The topic for this question is ${progressionHint}.
+Ask the next question: more challenging than the previous one, on a different topic or angle from what was already covered.
 ${variantFocus}
 ${visionContext}${cvContext}${topicsContext}
-Reply with ONLY the question, no introductions.`;
+Reply with exactly ONE short question that ends with a single question mark (under 45 words). A one-sentence scenario before it is fine. No greetings, no comments on the previous answer, and never two questions in a row.`;
       } else {
-        userPrompt = `Candidato: ${candidateName} | Vaga: ${role} | Nível: ${level} | Pergunta ${questionIndex + 1}/${maxQuestions} | Foco: ${progressionHint}.
-Faça a próxima pergunta — mais desafiadora que a anterior, sobre um TEMA ou ÂNGULO DIFERENTE do que já foi abordado.
+        userPrompt = `Você está entrevistando ${candidateName} para a vaga de ${role}, nível ${level}, e esta é a pergunta ${questionIndex + 1} de ${maxQuestions}.
+O tema desta pergunta é ${progressionHint}.
+Faça a próxima pergunta: mais desafiadora que a anterior, sobre um tema ou ângulo diferente do que já foi abordado.
 ${variantFocus}
 ${visionContext}${cvContext}${topicsContext}
-Responda APENAS com a pergunta, sem introduções.`;
+Responda com exatamente UMA pergunta curta, terminando com um único ponto de interrogação (menos de 45 palavras). Pode haver uma frase de contexto antes dela. Sem cumprimentos, sem comentar a resposta anterior e nunca duas perguntas seguidas.`;
       }
     }
 
@@ -406,12 +497,13 @@ Responda APENAS com a pergunta, sem introduções.`;
       { role: 'user', content: userPrompt },
     ];
 
-    return this.chat(messages);
+    return this.toSpokenReply(await this.chat(messages, { temperature: 0.7 }));
   }
 
   async evaluateAnswer(input: EvaluateAnswerInput): Promise<string> {
     const lang = input.language ?? 'pt';
-    const systemPrompt = lang === 'en' ? SYSTEM_PROMPT_EN : SYSTEM_PROMPT_PT;
+    const interviewer = input.interviewer ?? 'male';
+    const systemPrompt = lang === 'en' ? evaluationSystemPromptEn(interviewer) : evaluationSystemPromptPt(interviewer);
     const visionContext = this.buildVisionContext(input.visionMetrics, lang);
 
     let prompt: string;
@@ -422,8 +514,9 @@ The candidate answered: "${input.answer}"
 
 ${visionContext}
 
-Provide a brief response (2-3 sentences) acknowledging the answer and making a constructive comment before continuing the interview.
-Do NOT ask the next question now — only evaluate this answer briefly.`;
+Reply to the candidate directly, as you would on a call: 1 or 2 short sentences (under 40 words) reacting to the answer with a specific, honest comment.
+Talk TO the candidate ("you mentioned..."), never ABOUT them ("the candidate..."). Do not over-praise a weak answer.
+Do NOT ask anything, not even a rhetorical question, and end with a period.`;
     } else {
       prompt = `A pergunta feita foi: "${input.question}"
 
@@ -431,21 +524,52 @@ O candidato respondeu: "${input.answer}"
 
 ${visionContext}
 
-Forneça uma resposta breve (2-3 frases) reconhecendo a resposta e fazendo um comentário construtivo antes de continuar a entrevista.
-Não faça a próxima pergunta agora — apenas avalie esta resposta brevemente.`;
+Responda diretamente ao candidato, como numa chamada: 1 ou 2 frases curtas (menos de 40 palavras) reagindo à resposta com um comentário específico e honesto.
+Fale COM o candidato ("você mencionou..."), nunca SOBRE ele ("o candidato..."). Não elogie demais uma resposta fraca.
+NÃO pergunte nada, nem mesmo de forma retórica, e termine com um ponto final.`;
     }
 
-    return this.chat([
+    const reply = this.toSpokenReply(await this.chat([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: prompt },
-    ]);
+    ], { temperature: 0.5, numPredict: 160 }));
+    return this.withoutTrailingQuestions(reply, lang);
+  }
+
+  /**
+   * Safety net for spoken replies: models still occasionally wrap the text in
+   * quotes, prefix a label ("Pergunta 3:") or add markdown despite the prompt.
+   */
+  private toSpokenReply(text: string): string {
+    const unquote = (t: string) => t.replace(/^["“'‘]+|["”'’]+$/g, '').trim();
+    const cleaned = unquote(unquote(toSpeechText(text))
+      .replace(/^(?:(?:alex|sofia)\s*:\s*)?(?:pergunta|question|avalia[çc][ãa]o|evaluation|feedback|coment[áa]rio|comment|resposta|response)(?:\s+\d+)?\s*[:\-–—]\s*/i, ''));
+    return cleaned || text.trim();
+  }
+
+  /**
+   * Evaluations are spoken right before the next question, so a trailing
+   * "Can you elaborate?" would leave the candidate with two questions. Drops
+   * trailing question sentences and guarantees the reply ends with a period.
+   */
+  private withoutTrailingQuestions(text: string, lang: Language): string {
+    const sentences = text.split(/(?<=[.!?…]["”’']?)\s+/).filter((s) => s.trim().length > 0);
+    while (sentences.length > 0 && /\?["”’']?$/.test(sentences[sentences.length - 1].trim())) {
+      sentences.pop();
+    }
+    if (sentences.length === 0) {
+      return lang === 'en' ? 'Alright, let\'s move on.' : 'Certo, vamos seguir.';
+    }
+    const result = sentences.join(' ').trim();
+    return /[.!…]["”’']?$/.test(result) ? result : `${result}.`;
   }
 
   async generateFeedback(input: GenerateFeedbackInput): Promise<InterviewFeedback> {
     const lang = input.language ?? 'pt';
+    const interviewer = input.interviewer ?? 'male';
     const { conversationHistory, visionMetrics, role, candidateName, experienceLevel, sessionVariant } = input;
 
-    const systemPrompt = lang === 'en' ? SYSTEM_PROMPT_EN : SYSTEM_PROMPT_PT;
+    const systemPrompt = lang === 'en' ? systemPromptEn(interviewer) : systemPromptPt(interviewer);
     const visionContext = this.buildVisionContext(visionMetrics, lang);
     const variantFocus = lang === 'en' ? VARIANT_FOCUS_EN[sessionVariant] ?? '' : VARIANT_FOCUS_PT[sessionVariant] ?? '';
     const safeName = sanitizeInput(candidateName);
@@ -457,7 +581,7 @@ Não faça a próxima pergunta agora — apenas avalie esta resposta brevemente.
 - Candidate: ${safeName}
 - Position: ${safeRole}
 - Seniority level: ${experienceLevel}
-- Session focus: ${variantFocus}
+- ${variantFocus}
 
 IMPORTANT — calibrate every score relative to the expected bar for a ${experienceLevel} engineer in a ${safeRole} role:
 - A junior who correctly explains Big-O should score high in technical for their level.
@@ -487,7 +611,7 @@ Return a valid JSON with exactly this structure (no markdown, no text outside th
 - Candidato(a): ${safeName}
 - Vaga: ${safeRole}
 - Nível de senioridade: ${experienceLevel}
-- Foco da sessão: ${variantFocus}
+- ${variantFocus}
 
 IMPORTANTE — calibre cada nota em relação ao que se espera de um(a) ${experienceLevel} para a vaga de ${safeRole}:
 - Um júnior que explica Big-O corretamente deve ter nota alta em técnico para o seu nível.
@@ -525,14 +649,15 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
 
     // format: 'json' makes Ollama constrain decoding to valid JSON; the
     // normaliser still tolerates stray text and loosely-typed fields.
-    // Transport errors propagate so the caller can report failure and retry.
+    // Transport AND parse errors propagate: the caller reports feedback_failed
+    // and a retry regenerates, instead of persisting made-up 5/10 scores.
     const text = await this.chat(messages, { format: 'json', temperature: 0.4 });
 
     try {
       return this.normalizeFeedback(this.extractJson(text), lang);
     } catch (err) {
-      this.logger.error(`Failed to parse feedback JSON: ${(err as Error).message}`);
-      return this.defaultFeedback(lang);
+      this.logger.error(`Failed to parse feedback JSON: ${(err as Error).message} — raw: ${text.slice(0, 300)}`);
+      throw new Error('Could not generate feedback from the AI response — please retry');
     }
   }
 
@@ -591,8 +716,35 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
       .slice(0, 10);
   }
 
-  private normalizeFeedback(raw: Record<string, unknown>, lang: Language): InterviewFeedback {
-    const fallback = this.defaultFeedback(lang);
+  private hasScores(value: unknown): boolean {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const obj = value as Record<string, unknown>;
+    return SCORE_KEYS.some((k) => this.parseScore(obj[k]) !== null);
+  }
+
+  /**
+   * Finds the object holding the scores — models sometimes nest them, e.g.
+   * {"feedback": {...}} or {"scores": {...}, "summary": "..."}. Outer fields are
+   * kept so a top-level summary/strengths still count. Throws when there are none.
+   */
+  private locateFeedback(raw: Record<string, unknown>, depth = 0): Record<string, unknown> {
+    if (this.hasScores(raw)) return raw;
+    if (depth < 3) {
+      for (const value of Object.values(raw)) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          try {
+            return { ...raw, ...this.locateFeedback(value as Record<string, unknown>, depth + 1) };
+          } catch {
+            /* keep looking */
+          }
+        }
+      }
+    }
+    throw new Error('No score fields in feedback response');
+  }
+
+  private normalizeFeedback(json: Record<string, unknown>, lang: Language): InterviewFeedback {
+    const raw = this.locateFeedback(json);
     const technical = this.parseScore(raw.technical);
     const communication = this.parseScore(raw.communication);
     const confidence = this.parseScore(raw.confidence);
@@ -602,16 +754,20 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
     const overall = this.parseScore(raw.overall)
       ?? (known.length > 0 ? Math.round((known.reduce((a, b) => a + b, 0) / known.length) * 10) / 10 : null);
 
+    // locateFeedback guarantees at least one score, so overall is never null here.
+    // A missing category takes the overall score rather than an invented constant.
+    const base = overall ?? 0;
+
     const summary = typeof raw.summary === 'string' && raw.summary.trim().length > 0
       ? raw.summary.trim()
-      : fallback.summary;
+      : this.fallbackSummary(lang);
 
     return {
-      technical: technical ?? fallback.technical,
-      communication: communication ?? fallback.communication,
-      confidence: confidence ?? fallback.confidence,
-      clarity: clarity ?? fallback.clarity,
-      overall: overall ?? fallback.overall,
+      technical: technical ?? base,
+      communication: communication ?? base,
+      confidence: confidence ?? base,
+      clarity: clarity ?? base,
+      overall: base,
       summary,
       strengths: this.parseStringList(raw.strengths),
       improvements: this.parseStringList(raw.improvements),
@@ -632,13 +788,19 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
           messages,
           stream: false,
           ...(opts.format ? { format: opts.format } : {}),
-          options: { temperature: opts.temperature ?? 0.8 },
+          // Ollama's default context (2-4k tokens) silently drops the oldest
+          // messages — including the system prompt — in long sessions.
+          options: {
+            temperature: opts.temperature ?? 0.7,
+            num_ctx: 8192,
+            ...(opts.numPredict ? { num_predict: opts.numPredict } : {}),
+          },
         }),
         signal: AbortSignal.timeout(120_000),
       });
     } catch (fetchErr) {
       this.logger.error(`[AI] fetch threw (network error): ${(fetchErr as Error).message}`);
-      throw fetchErr;
+      throw new AIUnavailableError(`Ollama unreachable: ${(fetchErr as Error).message}`);
     }
 
     this.logger.log(`[AI] Ollama responded with status: ${res.status}`);
@@ -646,16 +808,21 @@ Retorne um JSON válido com exatamente esta estrutura (sem markdown, sem texto f
     if (!res.ok) {
       const body = await res.text();
       this.logger.error(`[AI] Ollama ${res.status} POST ${url} — ${body}`);
-      throw new Error(`Ollama error ${res.status}: ${body}`);
+      throw new AIUnavailableError(`Ollama error ${res.status}: ${body}`);
     }
 
-    const data = (await res.json()) as OllamaChatResponse;
+    let data: OllamaChatResponse;
+    try {
+      data = (await res.json()) as OllamaChatResponse;
+    } catch (err) {
+      throw new AIUnavailableError(`Ollama returned an unreadable response: ${(err as Error).message}`);
+    }
     if (data.error) {
-      throw new Error(`Ollama error: ${data.error}`);
+      throw new AIUnavailableError(`Ollama error: ${data.error}`);
     }
     const content = data.message?.content?.trim();
     if (!content) {
-      throw new Error('Ollama returned an empty response');
+      throw new AIUnavailableError('Ollama returned an empty response');
     }
     return content;
   }
@@ -668,28 +835,19 @@ Candidate behavioral metrics (0-1):
 - Eye contact: ${metrics.eye_contact.toFixed(2)}
 - Stress level: ${metrics.stress_level.toFixed(2)}
 - Confidence: ${metrics.confidence.toFixed(2)}
-Consider this data when formulating your response.`;
+Use it only to adjust your tone (e.g. be more encouraging if stress is high); never mention these numbers.`;
     }
     return `
 Métricas comportamentais do candidato (0-1):
 - Contato visual: ${metrics.eye_contact.toFixed(2)}
 - Nível de stress: ${metrics.stress_level.toFixed(2)}
 - Confiança: ${metrics.confidence.toFixed(2)}
-Considere esses dados ao formular sua resposta.`;
+Use apenas para ajustar o tom (por exemplo, um tom mais acolhedor se o stress estiver alto); nunca mencione esses números.`;
   }
 
-  private defaultFeedback(lang: Language = 'pt'): InterviewFeedback {
-    return {
-      technical: 5,
-      communication: 5,
-      confidence: 5,
-      clarity: 5,
-      overall: 5,
-      summary: lang === 'en'
-        ? 'Could not generate detailed feedback.'
-        : 'Não foi possível gerar feedback detalhado.',
-      strengths: [],
-      improvements: [],
-    };
+  private fallbackSummary(lang: Language = 'pt'): string {
+    return lang === 'en'
+      ? 'Could not generate detailed feedback.'
+      : 'Não foi possível gerar feedback detalhado.';
   }
 }

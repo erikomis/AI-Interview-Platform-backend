@@ -1,4 +1,15 @@
-import { InterviewFeedback, VisionMetrics, Language, ExperienceLevel } from '../entities/interview.entity';
+import { InterviewFeedback, VisionMetrics, Language, ExperienceLevel, Interviewer } from '../entities/interview.entity';
+
+/**
+ * Thrown when the language model cannot be reached or returns no usable reply
+ * (network error, timeout, non-2xx, error payload, empty content).
+ */
+export class AIUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AIUnavailableError';
+  }
+}
 
 export interface GenerateQuestionInput {
   role: string;
@@ -10,8 +21,10 @@ export interface GenerateQuestionInput {
   sessionVariant?: number;
   cvContext?: string;
   previousTopics?: string[];
-  /** Total questions in this session — drives the "Question i/N" hint and progression mapping. */
+  /** Total questions in this session — drives the "question i of N" hint and progression mapping. */
   maxQuestions?: number;
+  /** Interviewer persona (name/gender in the prompt); defaults to male. */
+  interviewer?: Interviewer;
 }
 
 export interface EvaluateAnswerInput {
@@ -20,6 +33,7 @@ export interface EvaluateAnswerInput {
   role: string;
   visionMetrics?: VisionMetrics | null;
   language?: Language;
+  interviewer?: Interviewer;
 }
 
 export interface GenerateFeedbackInput {
@@ -30,6 +44,7 @@ export interface GenerateFeedbackInput {
   experienceLevel: ExperienceLevel;
   sessionVariant: number;
   language?: Language;
+  interviewer?: Interviewer;
 }
 
 export interface IAIService {
